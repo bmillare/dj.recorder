@@ -1,0 +1,17 @@
+# Clojure / tools.deps
+/.cpcache/
+/target/
+/classes/
+*.class
+
+# nREPL
+/.nrepl-port
+
+# clj-kondo / LSP caches
+/.clj-kondo/.cache/
+/.lsp/.cache/
+
+# Nix / direnv
+/.direnv/
+result
+result-*

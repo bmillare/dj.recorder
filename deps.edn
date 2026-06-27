@@ -1,0 +1,17 @@
+{:paths ["src" "resources"]
+ :deps {}
+
+ :aliases
+ ;; Interactive nREPL server. Start with: clojure -M:nrepl
+ ;; Agents then evaluate via clj-nrepl-eval against the discovered port.
+ ;; See ../agent/ledger/2026-06-16-clojure-repl-light-workflow.md
+ {:nrepl
+  {:extra-deps {nrepl/nrepl {:mvn/version "1.5.1"}}
+   :main-opts ["-m" "nrepl.cmdline"]}
+
+  ;; Test sources + runner (wired up once we have tests).
+  :test
+  {:extra-paths ["test"]
+   :extra-deps {io.github.cognitect-labs/test-runner
+                {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+   :main-opts ["-m" "cognitect.test-runner"]}}}

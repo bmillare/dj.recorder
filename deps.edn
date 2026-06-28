@@ -2,12 +2,18 @@
  :deps {}
 
  :aliases
- ;; Interactive nREPL server. Start with: clojure -M:nrepl
- ;; Agents then evaluate via clj-nrepl-eval against the discovered port.
+ ;; Interactive nREPL server. Start with: clojure -M:nrepl       (src + resources)
+ ;; Full dev classpath (test + dev too):  clojure -M:nrepl:dev
+ ;; Agents then evaluate via clj-nrepl-eval against the discovered .nrepl-port.
  ;; See ../agent/ledger/2026-06-16-clojure-repl-light-workflow.md
  {:nrepl
   {:extra-deps {nrepl/nrepl {:mvn/version "1.5.1"}}
    :main-opts ["-m" "nrepl.cmdline"]}
+
+  ;; Dev sources on the classpath (the dogfood app + tests), so an nREPL can
+  ;; require/reload them interactively. Compose with :nrepl — `:nrepl:dev`.
+  :dev
+  {:extra-paths ["test" "dev"]}
 
   ;; Test sources + runner (wired up once we have tests).
   :test

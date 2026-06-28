@@ -16,8 +16,12 @@
          (p/apply-patch {:user {:name "Bob" :age 30}} {:user {:age 31}})))
   ;; C. delete a key inline while merging
   (is (= {:a 1} (p/apply-patch {:a 1 :b 2} {:b DISS})))
-  ;; D. nil is a real value (no nil=delete conflation)
-  (is (= {:a nil} (p/apply-patch {:a 1} {:a nil})))
+  ;; D. nil is the IDENTITY patch — "no change" (Option 1). It is neither a
+  ;;    delete (use dissoc) nor a value to store (use #replace nil). A nil
+  ;;    sub-patch leaves the key untouched, present or absent.
+  (is (= {:a 1} (p/apply-patch {:a 1} {:a nil})))                       ; present: unchanged
+  (is (= {} (p/apply-patch {} {:a nil})))                              ; absent: NOT added
+  (is (= {:a nil} (p/apply-patch {:a 1} {:a (p/read-replace nil)})))   ; store a literal nil
   ;; E. replace a whole subtree (escape) — :age is dropped
   (is (= {:user {:name "Alice"}}
          (p/apply-patch {:user {:name "Bob" :age 30}}
@@ -85,8 +89,11 @@
   (is (= 42 (p/apply-patch 41 42)))
   ;; L. changing the root's shape is explicit
   (is (= {:a 1} (p/apply-patch 42 (p/read-replace {:a 1}))))
-  ;; nil patch sets a leaf to nil (D, leaf form)
-  (is (= nil (p/apply-patch 1 nil))))
+  ;; nil is the identity patch (Option 1): a leaf is left unchanged...
+  (is (= 1 (p/apply-patch 1 nil)))
+  ;; ...and a bare nil patch on any root is a no-op — this is the safety net for
+  ;; a state->patch fn that returns nil (the natural "skip" reflex).
+  (is (= {:a 1} (p/apply-patch {:a 1} nil))))
 
 (deftest collision-errors
   (testing "map-patch onto a scalar throws (shape change must be #replace)"

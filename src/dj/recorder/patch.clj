@@ -11,7 +11,12 @@
   The one principle: an untagged patch is additive.
     map / record -> merge keys (recurse)      set    -> union
     vector       -> concat (append)           list   -> concat (append)
-    scalar       -> replace (nothing to add)
+    scalar       -> replace (nothing to add)  nil    -> NO CHANGE (identity)
+  `nil` is the identity patch everywhere — a no-op (Option 1). It is neither a
+  value to store nor a delete, so a `state->patch` fn that returns nil (the
+  natural \"skip\" reflex) is a safe no-op instead of nuking the root. The three
+  intents are now distinct and explicit: store a literal nil with
+  `#dj.recorder/replace nil`; remove a key with `dissoc`; \"no change\" is nil.
   Two escapes: `#dj.recorder/replace x` overwrites; `dissoc` removes
   (inline keyword tombstone for map keys / vector indices, op form for
   sets and bulk). `#dj.recorder/splice` does ordered positional vector
@@ -92,19 +97,24 @@
 (defn- apply-map
   "Merge a plain map/record patch `p` into `v` (markers already dispatched in
   `apply-patch`, so `p` here is data). Recurse per key; a value of `dissoc-kw`
-  removes that key (map/record) or index (vector, shifts the tail)."
+  removes that key (map/record) or index (vector, shifts the tail); a value of
+  nil leaves the key untouched — present or absent (the identity patch, Option
+  1; use #dj.recorder/replace nil to store a literal nil)."
   [v p]
   (when-not (or (nil? v) (associative? v))
     (throw (ex-info "cannot merge a map-patch into a non-associative value; use #dj.recorder/replace for a shape change"
                     {:value v :patch p})))
   (reduce-kv
    (fn [acc k pv]
-     (if (= pv dissoc-kw)
+     (cond
+       ;; nil sub-patch = no change to this key (don't touch it, don't add it).
+       (nil? pv)        acc
+       (= pv dissoc-kw)
        (cond
          (vector? acc)      (vec-remove acc k)   ; k = integer index (shifts tail)
          (associative? acc) (dissoc acc k)       ; map or record key
          :else (throw (ex-info "inline dissoc target not associative" {:key k :value acc})))
-       (assoc acc k (apply-patch (get acc k) pv)))) ; assoc preserves record/vector type
+       :else (assoc acc k (apply-patch (get acc k) pv)))) ; assoc preserves record/vector type
    (or v {})
    p))
 
@@ -114,6 +124,11 @@
   type-collision rules; incompatible container merges throw (fail loud)."
   [v p]
   (cond
+    ;; nil is the identity patch: no change (Option 1). NOT a value to store
+    ;; and NOT a delete — store a literal nil with #dj.recorder/replace nil,
+    ;; remove with dissoc. This makes a state->patch fn returning nil (the
+    ;; natural \"skip\" reflex) a safe no-op instead of nuking the root.
+    (nil? p)              v
     ;; markers first — they are also map?
     (instance? Replace p) (:value p)
     (instance? Dissoc p)  (let [c (:coll p)]
@@ -134,7 +149,7 @@
     (seq? p)    (do (when-not (or (nil? v) (seq? v))
                       (throw (ex-info "list-patch requires a list/seq or nil" {:value v :patch p})))
                     (concat (or v ()) p))        ; lists/seqs -> append
-    :else       p))                              ; scalar -> replace the leaf
+    :else       p))                              ; non-nil scalar -> replace the leaf
 
 (defn rehydrate
   "Replay a sequence of `patches` onto `baseline` — `(reduce apply-patch ...)`."

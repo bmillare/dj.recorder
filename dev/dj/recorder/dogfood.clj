@@ -106,28 +106,22 @@
       (println "  strobe plays =>" (get-in @db [:tracks "strobe" :plays]))
       (assert (= 1 (get-in @db [:tracks "strobe" :plays])))
 
-      (line "9. FOOTGUN — an authoring fn that returns nil NUKES the state")
-      ;; FRICTION(SHARP): returning nil to mean \"skip / no change\" is the
-      ;; natural Clojure reflex, but `(apply-patch s nil)` => nil (scalar
-      ;; leaf-replace at the ROOT), so the whole db becomes nil and that nil
-      ;; is persisted. The no-op idiom is `{}` (empty-map merge), NOT nil.
-      ;; Demonstrated here against a THROWAWAY db so we don't harm the main one.
-      (let [tmp  (fresh-path)
-            tdb  (r/open tmp)]
+      (line "9. nil is the identity patch — returning nil is a safe no-op")
+      ;; Option 1 (design pt D): a state->patch fn that returns nil — the
+      ;; natural \"skip / no change\" reflex — leaves the db untouched and
+      ;; persists nothing. (It used to replace the whole root with nil; that
+      ;; footgun is gone.) The three intents are now distinct and explicit:
+      ;; no-change = nil; remove = dissoc; store a literal nil = #replace nil.
+      (let [tmp (fresh-path) tdb (r/open tmp)]
         (r/record!-sync tdb {:keep 1})
-        (try
-          (r/record!-sync tdb (fn [_] nil))         ; the reflex "no change"
-          (catch Throwable _ nil))
-        (println "  after (fn [_] nil), throwaway @db =>" (pr-str @tdb)
-                 "  <-- state destroyed, NOT preserved")
-        (assert (nil? @tdb))
-        ;; The safe no-op: return {} instead.
-        (let [tmp2 (fresh-path) tdb2 (r/open tmp2)]
-          (r/record!-sync tdb2 {:keep 1})
-          (r/record!-sync tdb2 (fn [_] {}))         ; correct no-op
-          (println "  after (fn [_] {}),  throwaway @db =>" (pr-str @tdb2) "  <-- preserved")
-          (assert (= {:keep 1} @tdb2))
-          (r/close! tdb2))
+        (r/record!-sync tdb (fn [_] nil))           ; the reflex "no change"
+        (println "  after (fn [_] nil), @db =>" (pr-str @tdb) "  <-- preserved, not nilled")
+        (assert (= {:keep 1} @tdb))
+        ;; To intentionally STORE nil at a key, ask for it explicitly:
+        (r/record!-sync tdb {:note #dj.recorder/replace nil})
+        (println "  after #replace nil at :note, @db =>" (pr-str @tdb))
+        (assert (= {:keep 1 :note nil} @tdb))
+        (assert (contains? @tdb :note) ":note is present with a literal nil value")
         (r/close! tdb))
 
       (line "10. fail-loud — bad patch is rejected; the db survives, no halt")

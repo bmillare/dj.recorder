@@ -83,6 +83,27 @@
             "and the db keeps working after a rejected tx")
         (finally (r/close! db))))))
 
+(deftest nil-patch-fn-is-a-safe-no-op
+  ;; Option 1 (design pt D): a state->patch fn that returns nil — the natural
+  ;; "skip / no change" reflex — must be a NO-OP. Before this it replaced the
+  ;; whole root with nil and persisted it (silent total data loss).
+  (with-path [path]
+    (let [db (r/open path)]
+      (try
+        (r/record!-sync db {:keep 1})              ; seed real, persisted state
+        (is (= {:keep 1} (r/record!-sync db (fn [_] nil)))
+            "nil return leaves the realized state untouched")
+        (is (= {:keep 1} @db) "the db is preserved, not nilled")
+        (is (nil? (r/halted db)) "a nil patch does not halt the db")
+        (r/record!-sync db {:added true})          ; still writable afterwards
+        (finally (r/close! db)))
+      ;; and the nil no-op persisted nothing: a fresh re-open replays no nil
+      ;; line, so it rehydrates to exactly the writes that mattered.
+      (let [db2 (r/open path)]
+        (try (is (= {:keep 1 :added true} @db2)
+                 "re-open proves the nil no-op wrote nothing to the log")
+             (finally (r/close! db2)))))))
+
 (deftest read-your-writes-via-await
   (with-path [path]
     (let [db (r/open path)]

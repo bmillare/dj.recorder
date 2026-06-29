@@ -13,6 +13,7 @@
   Friction observed while writing this is marked `;; FRICTION:` inline and
   summarized in agent/ledger/2026-06-27-alpha-dogfood-friction.md."
   (:require [dj.recorder :as r]
+            [dj.recorder.patch :as patch]
             [dj.recorder.storage :as storage]
             [clojure.java.io :as io]))
 
@@ -80,13 +81,12 @@
       (println "  crate =>" (pr-str (get-in @db [:crates "mainroom"])))
       (assert (= ["strobe" "every" "opus"] (get-in @db [:crates "mainroom"])))
 
-      (line "6. SPLICE a move — relocate strobe (idx 0) to the end")
-      ;; FRICTION(high): a "move" is two coordinated, original-relative,
-      ;; non-overlapping hunks AND you must name the value you're moving
-      ;; ("strobe"). There is no move/swap sugar — this is the strongest
-      ;; signal that a higher-level helper (or diff->patch) would earn its keep.
-      (r/record!-sync db {:crates {"mainroom" #dj.recorder/splice [{:at 0 :- 1}
-                                                                   {:at 3 :- 0 :+ ["strobe"]}]}})
+      (line "6. patch/move — relocate strobe (idx 0) to the end")
+      ;; RESOLVED(was FRICTION-high): a "move" used to be two coordinated,
+      ;; original-relative, non-overlapping splice hunks with the value named by
+      ;; hand. `patch/move` builds that splice from final-position indices: send
+      ;; it inside the authoring fn so `s` is the dispatch-thread vector.
+      (r/record!-sync db (fn [s] (patch/move s [:crates "mainroom"] 0 2)))
       (println "  crate =>" (pr-str (get-in @db [:crates "mainroom"])))
       (assert (= ["every" "opus" "strobe"] (get-in @db [:crates "mainroom"])))
 
@@ -96,13 +96,13 @@
       (println "  opus tags =>" (pr-str (get-in @db [:tracks "opus" :tags])))
       (assert (= #{:peaktime} (get-in @db [:tracks "opus" :tags])))
 
-      (line "8. read-modify-write authoring fn — bump a play counter")
-      ;; FRICTION(med, RI-8): the READ is easy (get-in s ...), but you then
-      ;; hand-rebuild the full nesting path for the patch. A `d-update-in`
-      ;; helper that returns the nested patch map would remove this re-nesting;
-      ;; this is the concrete authoring friction RI 8 flagged.
-      (r/record!-sync db (fn [s]
-                           {:tracks {"strobe" {:plays (inc (get-in s [:tracks "strobe" :plays]))}}}))
+      (line "8. patch/update-in — read-modify-write a play counter")
+      ;; RESOLVED(was FRICTION-med, RI-8): the READ was easy (get-in s ...) but
+      ;; you then hand-rebuilt the full nesting path. `patch/update-in` is
+      ;; clojure.core/update-in that returns the nested patch instead of a new
+      ;; map — no re-nesting, mirrors the core arg order, and overwrites the
+      ;; leaf faithfully (a shrinking f is reflected; collection/nil → #replace).
+      (r/record!-sync db (fn [s] (patch/update-in s [:tracks "strobe" :plays] (fnil inc 0))))
       (println "  strobe plays =>" (get-in @db [:tracks "strobe" :plays]))
       (assert (= 1 (get-in @db [:tracks "strobe" :plays])))
 

@@ -146,3 +146,60 @@
             :tags #{:b}
             :items [1 :x 2 3]}
            (p/rehydrate {} reread)))))
+
+;; ---------------------------------------------------------------------------
+;; Authoring helpers — patch/update-in (RMW) and patch/move.
+;; Spec: agent/ledger/2026-06-29-rmw-helper-and-diff-to-patch.md (Option E).
+;; ---------------------------------------------------------------------------
+
+(deftest update-in-helper
+  (testing "scalar RMW yields a clean nested literal and applies as update-in"
+    (let [s {:tracks {"strobe" {:plays 3 :tags #{:a}}}}]
+      (is (= {:tracks {"strobe" {:plays 4}}}
+             (p/update-in s [:tracks "strobe" :plays] inc)))     ; no #replace noise
+      (is (= {:tracks {"strobe" {:plays 4 :tags #{:a}}}}         ; siblings preserved
+             (p/apply-patch s (p/update-in s [:tracks "strobe" :plays] inc))))))
+  (testing "extra args are passed to f (fnil-style on an absent leaf)"
+    (is (= {:n 1} (p/apply-patch {} (p/update-in {} [:n] (fnil inc 0))))))
+  (testing "a shrinking f (dissoc) is reflected — overwrite, not additive merge"
+    (let [s {:t {:p 3 :tags #{:a}}}]
+      (is (= {:t {:p 3}} (p/apply-patch s (p/update-in s [:t] dissoc :tags))))))
+  (testing "f returning nil stores a literal nil (faithful to update-in, not a no-op)"
+    (let [s {:t {:p 3}}]
+      (is (= {:t {:p nil}}
+             (p/apply-patch s (p/update-in s [:t :p] (constantly nil)))))))
+  (testing "empty path updates the root"
+    (is (= 42 (p/apply-patch 41 (p/update-in 41 [] inc))))
+    (is (= {:a 1} (p/apply-patch {} (p/update-in {} [] (constantly {:a 1}))))))
+  (testing "collection result wraps in #replace so it round-trips through the log"
+    (let [s     {:t {:tags #{:a}}}
+          patch (p/update-in s [:t] dissoc :tags)
+          back  (edn/read-string {:readers p/data-readers} (pr-str patch))]
+      (is (= (p/apply-patch s patch) (p/apply-patch s back))))))
+
+(deftest move-helper
+  (testing "move matches remove-then-insert for every (from,to) on the vector"
+    (let [v [:a :b :c :d]]
+      (doseq [from (range (count v)), to (range (count v))]
+        (let [el      (nth v from)
+              without (vec (concat (subvec v 0 from) (subvec v (inc from))))
+              expect  (vec (concat (subvec without 0 to) [el] (subvec without to)))]
+          (is (= expect (p/apply-patch v (p/move v [] from to)))
+              (str "move " from "->" to))))))
+  (testing "the dogfood case: first element to the end, nested at a path"
+    (let [s {:crates {"main" [:a :b :c]}}]
+      (is (= {:crates {"main" [:b :c :a]}}
+             (p/apply-patch s (p/move s [:crates "main"] 0 2))))
+      ;; the generated patch is the inspectable splice from the friction doc
+      (is (= {:crates {"main" (p/read-splice [{:at 0 :- 1} {:at 3 :+ [:a]}])}}
+             (p/move s [:crates "main"] 0 2)))))
+  (testing "from = to is a no-op (nil identity patch)"
+    (is (nil? (p/move {:xs [:a :b]} [:xs] 1 1))))
+  (testing "non-vector target and out-of-bounds indices throw"
+    (is (thrown? clojure.lang.ExceptionInfo (p/move {:xs 5} [:xs] 0 1)))
+    (is (thrown? clojure.lang.ExceptionInfo (p/move {:xs [:a :b]} [:xs] 0 5))))
+  (testing "the move patch round-trips through the EDN log format"
+    (let [v     [:a :b :c]
+          patch (p/move v [] 0 2)
+          back  (edn/read-string {:readers p/data-readers} (pr-str patch))]
+      (is (= (p/apply-patch v patch) (p/apply-patch v back))))))

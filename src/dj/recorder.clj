@@ -91,8 +91,10 @@
              :discard (storage/truncate-to path (:offset torn-tail))
              :surface (throw (ex-info (str "dj.recorder: torn trailing record at " path
                                            " (byte offset " (:offset torn-tail)
-                                           ") — the in-flight tx lost to a crash. Inspect :torn-tail,"
-                                           " then re-open with {:on-torn-tail :discard} to drop it.")
+                                           ") — the in-flight tx lost to a crash. Inspect the ex-data's"
+                                           " :dj.recorder/torn-tail — read :text for the fragment (a tear"
+                                           " mid-multibyte-char shows a trailing �; :bytes has the raw"
+                                           " bytes). Then re-open with {:on-torn-tail :discard} to drop it.")
                                       {:dj.recorder/torn-tail torn-tail :path (str path)}))
              (throw (ex-info "dj.recorder: unknown :on-torn-tail policy (want :surface or :discard)"
                              {:on-torn-tail on-torn-tail}))))

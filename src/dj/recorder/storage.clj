@@ -99,8 +99,14 @@
      :count     <number of complete records replayed>
      :torn-tail nil
               | {:offset <byte index where the partial trailing record starts>
-                 :bytes  <byte-array of the raw partial>
-                 :text   <the partial decoded as UTF-8, for inspection>}}
+                 :bytes  <byte-array of the raw partial — the source of truth>
+                 :text   <the partial decoded as UTF-8, for human inspection>}}
+
+  `:bytes` is the byte-exact fragment; `:text` is a convenience decode for
+  reading it. The decode is lossy at the tear: if the crash split a multi-byte
+  character, the dangling bytes can't form a code point and collapse to a single
+  U+FFFD (the `String(byte[], UTF-8)` REPLACE behavior). For byte-level forensics
+  on such a tail, use `:bytes`, not `:text`.
 
   A missing or empty file yields `baseline` with no torn tail. A trailing
   record without its terminating \\n is the in-flight tx lost to a crash

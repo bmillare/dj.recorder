@@ -1,5 +1,5 @@
 (ns dj.recorder-test
-  "Exercises the public API / lifecycle (alpha item 4): open/patch!/tx!/@db/
+  "Exercises the public API / lifecycle: open/patch!/tx!/@db/
   await/close!, the update!/move! sugar, deref-based read-your-writes (the error
   channel surfaces a rejected tx as a Throwable), durable round-trip across a
   close+re-open, the torn-tail :surface/:discard policy, the single-writer lock,

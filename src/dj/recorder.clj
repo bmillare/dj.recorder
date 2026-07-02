@@ -1,5 +1,5 @@
 (ns dj.recorder
-  "dj.recorder — the public API / lifecycle for the alpha (item 4).
+  "dj.recorder — the public API / lifecycle.
 
   A durable, crash-safe reference for *native* Clojure data structures: the
   read ergonomics of an atom (synchronous `deref`) with the durability of an
@@ -17,29 +17,25 @@
     (r/close! db)                        ; drain, close the file, release the lock
 
   This namespace is a thin composition layer: it wires the single-writer file
-  lock + torn-tail-aware rehydrate (storage, item 2) into the on-demand vthread
-  drainer (dispatch, item 3). All the hard contracts live there; here we own
-  lifecycle (open/close), the read-your-writes story, and the torn-tail policy.
+  lock + torn-tail-aware rehydrate (storage) into the on-demand vthread drainer
+  (dispatch). All the hard contracts live there; here we own lifecycle
+  (open/close), the read-your-writes story, and the torn-tail policy.
 
-  Contracts surfaced here (runtime deep-dive):
-    §1  unit of change = a `state -> patch` fn; only the returned *data* patch
-        is persisted. `tx!` takes such a fn; `patch!` is the literal-patch
-        `(constantly patch)` arity. `update!`/`move!` are `tx!` sugar.
-    §3  persist-then-publish: `@db` is the last *durably-written* state and may
-        lag the queue. Read-your-writes is opt-in: `@(patch! …)`/`@(tx! …)` or
-        `(await …)`.
-    §4  torn tail on rehydrate is SURFACED by default (open raises with the
-        offset + raw bytes); `:on-torn-tail :discard` truncates and proceeds.
-    §5  a halted db (I/O failure) stays `deref`-able but rejects writes;
-        inspect via `error`; recover via `close!` + re-`open`.
-    §6  single-writer lock held for the db's life. `close!` SEALS the dispatch
-        core in the core's own atomic state (dispatch/quiesce!), so a racing
-        `tx!` cannot slip in behind the drain — the closed-flag check in this
-        namespace is only the friendly-error fast path, never the guard. The
-        lock is released in a `finally`, so a failing close never strands it."
+  Contracts surfaced here (detailed in the runtime deep-dive §1/§3–§6;
+  summarized in live/north_star.md):
+    §1  unit of change = a `state -> patch` fn; only the returned data patch is
+        persisted. `patch!` is the `(constantly patch)` arity; `update!`/`move!`
+        are `tx!` sugar.
+    §3  persist-then-publish: `@db` is the last durably-written state and may lag
+        the queue; read-your-writes is opt-in (deref the promise or `await`).
+    §4  a torn tail on rehydrate is surfaced by default; `:discard` truncates.
+    §5  a halted db stays `deref`-able but rejects writes (inspect via `error`).
+    §6  single-writer lock held for the db's life; `close!` seals the core
+        (quiesce!) then releases the lock in a `finally`."
   (:refer-clojure :exclude [await])
   (:require [dj.recorder.storage :as storage]
             [dj.recorder.dispatch :as dispatch]
+            [dj.recorder.protocols :as proto]
             [dj.recorder.patch :as patch])
   (:import [java.util.concurrent.locks Lock]))
 
@@ -61,7 +57,7 @@
 
 (defmethod print-method Recorder [^Recorder db ^java.io.Writer w]
   (.write w (str "#dj.recorder/db " (pr-str {:path (.-path db)
-                                             :halted? (some? (dispatch/error (.-core db)))
+                                             :halted? (some? (proto/error (.-core db)))
                                              :closed? @(.-a-closed db)}))))
 
 ;; ---------------------------------------------------------------------------
@@ -117,7 +113,7 @@
                              {:on-torn-tail on-torn-tail}))))
          (let [writer (storage/open-writer path)]
            (try
-             (let [append!    (fn [patch] (storage/append! writer patch))
+             (let [append!    (fn [patch] (proto/append! writer patch))
                    state-atom (atom state)
                    core       (dispatch/make-core state-atom append!)]
                (->Recorder core state-atom writer lock path (atom false)))
@@ -163,7 +159,7 @@
   (when @(.-a-closed db)
     (throw (ex-info "dj.recorder: db is closed"
                     {:dj.recorder/closed true :path (str (.-path db))})))
-  (dispatch/submit! (.-core db) f))
+  (proto/submit! (.-core db) f))
 
 (defn patch!
   "Enqueue a literal `patch` (plain data) and return its per-tx promise: sugar
@@ -207,15 +203,15 @@
   stray drainer is ever spawned post-close). For a halt-tolerant drain, close!
   handles it."
   [^Recorder db]
-  (dispatch/await (.-core db))
+  (proto/await (.-core db))
   nil)
 
 (defn error
   "The `Throwable` that halted this db via an I/O failure, or nil if it is still
-  live (§5). Named after `agent-error`, matching `dispatch/error`. A halted db
+  live (§5). Named after `agent-error`, matching `proto/error`. A halted db
   is still `deref`-able but rejects writes; recover by `close!` + re-`open`."
   [^Recorder db]
-  (dispatch/error (.-core db)))
+  (proto/error (.-core db)))
 
 (defn close!
   "Drain in-flight work, close the writer, and release the single-writer lock

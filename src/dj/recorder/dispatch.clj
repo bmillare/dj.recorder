@@ -1,5 +1,5 @@
 (ns dj.recorder.dispatch
-  "The dispatch core for dj.recorder — alpha item 3.
+  "The dispatch core for dj.recorder.
   A single on-demand virtual thread (the *drainer*) walks a queue of pending
   transactions, applying each in submission order. At most one drainer is alive
   at a time, so transactions form a total order with no per-item locking and a
@@ -33,7 +33,7 @@
             has unwound; a runaway patch-fn is a user-code verdict).
           - I/O append error: HALT — set the core's error, reject all pending
             txs with it, stop the drainer, and refuse further submits (writes
-            throw). Reads still work; recover via close! + re-open (item 4).
+            throw). Reads still work; recover via close! + re-open.
           - VirtualMachineError (other than StackOverflowError): process
             health, never a tx verdict. Always escalates to HALT via the
             drainer's backstop, regardless of phase.
@@ -41,7 +41,7 @@
         rather than a silently dead drainer.
     §7  INTERRUPTS ARE NOT A CONTROL CHANNEL. The queue is the drainer's only
         control channel; nothing may ever interrupt the drainer thread.
-        Shutdown (item 4's close!) is expressed through the queue — seal the
+        Shutdown (the public close!) is expressed through the queue — seal the
         core, enqueue a final barrier, and join the drainer (see `quiesce!`
         and the `drainer` field). Under this invariant an InterruptedException
         escaping a patch-fn can only mean the patch-fn did its own thread
@@ -50,16 +50,16 @@
         redesigned first.
 
   Pure dispatch + the injected `append` fn; no file knowledge of its own
-  (storage is item 2, the public API/lifecycle is item 4). `append` is
-  `(fn [patch])` that durably persists one patch and may throw on I/O failure.
+  (storage and the public API/lifecycle live in sibling namespaces). `append`
+  is `(fn [patch])` that durably persists one patch and may throw on I/O failure.
 
   Per-tx promises resolve to the new realized state on success or to a
   `Throwable` on failure — deliberately, at this layer: the drainer must never
-  throw across the promise boundary, and the public wrapper (item 4) owns the
+  throw across the promise boundary, and the public wrapper owns the
   caller-facing ergonomics (deref-throws / CompletableFuture / variant map).
   Pinned non-goal: a legitimate state value is never itself a Throwable."
-  (:refer-clojure :exclude [await])
-  (:require [dj.recorder.patch :as patch])
+  (:require [dj.recorder.patch :as patch]
+            [dj.recorder.protocols :as proto])
   (:import (clojure.lang IDeref PersistentQueue)))
 
 (set! *warn-on-reflection* true)
@@ -67,35 +67,8 @@
 (def ^:private empty-queue PersistentQueue/EMPTY)
 
 ;; ---------------------------------------------------------------------------
-;; Protocol + type
+;; The Core type (implements dj.recorder.protocols/IRecorderCore)
 ;; ---------------------------------------------------------------------------
-
-(defprotocol IRecorderCore
-  (submit! [core patch-fn]
-    "Enqueue a `state → patch` authoring fn and ensure a drainer is running.
-    Returns the per-tx promise: it resolves to the new realized state on
-    success, or to a `Throwable` on a patch/authoring or I/O error (§5).
-    Submission order is commit order. Throws if the core is halted — writes
-    throw on a halted db; reads (`deref`) still work. Recover via the public
-    lifecycle's close!/re-open. Also throws once quiesce! has sealed the core
-    (closed db). Enqueue, halted-check, and sealed-check are one atomic swap,
-    so a submit can never be stranded by a concurrent halt nor slip in behind
-    a close.")
-  (await [core]
-    "Block until every tx queued *before this call* has been processed
-    (agent-style `await`). Implemented as a first-class barrier item: it is
-    never authored, applied, or persisted — its promise resolving simply means
-    all prior txs drained. Returns nil. Throws the halted ex-info (same shape
-    as `submit!`, cause = the halting Throwable) if the core is already halted
-    OR halts before the barrier drains — matching `clojure.core/await`, which
-    throws on a failed agent — and the closed ex-info on a sealed core (no
-    barrier is enqueued, so no stray drainer is ever spawned post-close).
-    `await` returning nil therefore *guarantees* everything queued before it
-    is durable.")
-  (error [core]
-    "The Throwable that halted this core (I/O failure, VM error, or a dispatch
-    bug caught by the drainer backstop — §5), or nil if it is still live.
-    Named after `agent-error`."))
 
 (declare enqueue! halted-ex sealed-ex)
 
@@ -121,7 +94,7 @@
   ;; handle for testing dispatch in isolation.)
   (deref [_] @state)
 
-  IRecorderCore
+  proto/IRecorderCore
   (submit! [core patch-fn]
     (let [p (promise)
           r (enqueue! core {:patch-fn patch-fn :promise p})]
@@ -310,7 +283,7 @@
 ;; ---------------------------------------------------------------------------
 
 (defn quiesce!
-  "Bring the core to rest for item 4's close! (§6/§7): in ONE atomic swap, SEAL
+  "Bring the core to rest for the public close! (§6/§7): in ONE atomic swap, SEAL
   the core — every subsequent submit!/await refuses, so the check-then-act race
   on any external closed flag is unrepresentable, the same trick as
   halted-vs-enqueue (§2) — and enqueue a final barrier (skipped when the core

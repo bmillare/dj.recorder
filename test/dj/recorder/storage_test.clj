@@ -8,7 +8,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.java.io :as io]
             [dj.recorder.patch :as p]
-            [dj.recorder.storage :as s])
+            [dj.recorder.storage :as s]
+            [dj.recorder.protocols :as proto])
   (:import [java.nio.file Files]
            [java.util.concurrent TimeUnit]
            [java.util.concurrent.locks Lock]))
@@ -34,7 +35,7 @@
                  {:items [1 2 3]}
                  {:items (p/read-splice [{:at 1 :+ [:x]}])}]]
     (with-open [w (s/open-writer path)]
-      (doseq [pt patches] (s/append! w pt)))
+      (doseq [pt patches] (proto/append! w pt)))
     (let [res (s/read-log {} path)]
       (is (nil? (:torn-tail res)) "a cleanly-terminated log has no torn tail")
       (is (= (count patches) (:count res)))
@@ -52,9 +53,9 @@
   ;; than persisting an unreadable line for replay to choke on later.
   (let [path (tmp-path)]
     (with-open [w (s/open-writer path)]
-      (s/append! w {:ok 1})                        ; one good, committed record
+      (proto/append! w {:ok 1})                        ; one good, committed record
       (let [before (file-bytes path)
-            ex     (try (s/append! w {:bad (fn [] 42)}) nil
+            ex     (try (proto/append! w {:bad (fn [] 42)}) nil
                         (catch clojure.lang.ExceptionInfo e e))]
         (is (some? ex) "a non-EDN patch is refused at append!")
         (is (= [:bad] (:dj.recorder/edn-path (ex-data ex)))
@@ -82,8 +83,8 @@
 (deftest torn-tail-surfaced
   (let [path (tmp-path)]
     (with-open [w (s/open-writer path)]
-      (s/append! w {:a 1})
-      (s/append! w {:b 2}))
+      (proto/append! w {:a 1})
+      (proto/append! w {:b 2}))
     ;; simulate a crash mid-append: a partial final record with no trailing \n
     (spit path "{:c 3" :append true)
     (let [res (s/read-log {} path)]
@@ -99,7 +100,7 @@
   ;; the partial is never parsed — even unreadable garbage is surfaced as-is.
   (let [path (tmp-path)]
     (with-open [w (s/open-writer path)]
-      (s/append! w {:a 1}))
+      (proto/append! w {:a 1}))
     (spit path "{:c 3 :open [#unbalanced" :append true)
     (let [res (s/read-log {} path)]
       (is (= {:a 1} (:state res)))
@@ -118,7 +119,7 @@
 (deftest truncate-discards-torn-tail
   (let [path (tmp-path)]
     (with-open [w (s/open-writer path)]
-      (s/append! w {:a 1}))
+      (proto/append! w {:a 1}))
     (spit path "{:partial" :append true)
     (s/truncate-to path (:offset (:torn-tail (s/read-log {} path))))
     (let [res (s/read-log {} path)]
@@ -131,7 +132,7 @@
   ;; stale :offset (from a read of a file that has since shrunk) masking a bug.
   (let [path (tmp-path)]
     (with-open [w (s/open-writer path)]
-      (s/append! w {:a 1}))
+      (proto/append! w {:a 1}))
     (let [size (file-bytes path)]
       (is (thrown? clojure.lang.ExceptionInfo (s/truncate-to path (inc size)))
           "an offset past the end is refused")
@@ -147,7 +148,7 @@
     (binding [*print-length* 3
               *print-level*  1]
       (with-open [w (s/open-writer path)]
-        (s/append! w big)))
+        (proto/append! w big)))
     (is (= big (:state (s/read-log {} path)))
         "the full structure persists despite ambient print limits")))
 

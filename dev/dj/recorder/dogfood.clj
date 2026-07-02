@@ -1,5 +1,5 @@
 (ns dj.recorder.dogfood
-  "Alpha item 5 — exercise/dogfood. A small but real app on the public API:
+  "Exercise/dogfood — a small but real app on the public API:
   a DJ crate/library manager. Tracks live in a map keyed by id; crates are
   ORDERED vectors of ids (the splice stress case). We drive the whole public
   surface (open/patch!/tx!/update!/move!/await/@db/close!) through additive

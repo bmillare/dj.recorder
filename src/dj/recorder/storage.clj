@@ -2,7 +2,7 @@
   "The durable substrate for dj.recorder: an append-only EDN log, a
   torn-tail-aware rehydrate, and a single-writer file lock.
 
-  Pure storage — no dispatch, no public API; those sit on top (items 3-4).
+  Pure storage — no dispatch, no public API; those sit on top.
   Design: agent/ledger/2026-06-27-runtime-design-deep-dive.md §4 (crash
   safety without fsync), §6 (rehydration / locking).
 
@@ -18,8 +18,7 @@
   mid-log corruption is detected and located rather than inferred.
 
   We do NOT silently drop a torn tail; `read-log` surfaces it (offset + raw
-  bytes) for inspection, and the caller decides whether to discard it
-  (item 4).
+  bytes) for inspection, and the caller decides whether to discard it.
 
   Log format: one patch per line, `(pr-str patch)` + \\n, UTF-8. With
   `*print-readably*` pinned true (see `append!`), pr-str escapes embedded
@@ -34,7 +33,8 @@
   re-read via `patch/data-readers`."
   (:require [clojure.java.io :as io]
             [clojure.edn :as edn]
-            [dj.recorder.patch :as patch])
+            [dj.recorder.patch :as patch]
+            [dj.recorder.protocols :as proto])
   (:import [java.io ByteArrayInputStream PushbackReader Writer]
            [java.nio.charset StandardCharsets]
            [java.nio.channels FileChannel FileLock OverlappingFileLockException]
@@ -46,15 +46,8 @@
 (set! *warn-on-reflection* true)
 
 ;; ---------------------------------------------------------------------------
-;; Append-only writer
+;; Append-only writer (implements dj.recorder.protocols/AppendLog)
 ;; ---------------------------------------------------------------------------
-
-(defprotocol AppendLog
-  (append! [log patch]
-    "Append one patch to the log as a single EDN line and flush. The flush
-    pushes to the OS page cache — durable across a process crash, not
-    necessarily across power loss (see the ns docstring). Throws (leaving
-    the log untouched) if `patch` does not round-trip as EDN."))
 
 (defn- assert-round-trips!
   "Verify that `line` (the serialized form of `patch`) parses back through the
@@ -97,7 +90,7 @@
   ^java.lang.AutoCloseable [path]
   (let [w ^Writer (io/writer path :append true :encoding "UTF-8")]
     (reify
-      AppendLog
+      proto/AppendLog
       (append! [_ patch]
         ;; Structural EDN gate ([D4]): reject records-used-as-patch, live
         ;; objects, functions — anything outside patch's replayable-EDN

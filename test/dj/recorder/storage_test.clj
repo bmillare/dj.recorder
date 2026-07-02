@@ -45,10 +45,11 @@
           "markers round-trip through the actual file path"))))
 
 (deftest append-refuses-non-edn-patch
-  ;; The write-path choke point: a patch carrying a live object (here a fn,
-  ;; which pr-str emits as #object[...]) does not round-trip through our own
-  ;; reader, so append! must throw and leave the log byte-for-byte untouched
-  ;; rather than persist an unreadable line for replay to choke on later.
+  ;; The write-path choke point: a patch carrying a live object (here a fn) is
+  ;; outside patch's replayable-EDN whitelist, so the structural gate
+  ;; (`patch/assert-edn!`, [D4]) refuses it at append! — pointing at the
+  ;; offending leaf's path — and the log is left byte-for-byte untouched rather
+  ;; than persisting an unreadable line for replay to choke on later.
   (let [path (tmp-path)]
     (with-open [w (s/open-writer path)]
       (s/append! w {:ok 1})                        ; one good, committed record
@@ -56,10 +57,10 @@
             ex     (try (s/append! w {:bad (fn [] 42)}) nil
                         (catch clojure.lang.ExceptionInfo e e))]
         (is (some? ex) "a non-EDN patch is refused at append!")
-        (is (contains? (ex-data ex) :dj.recorder/invalid-patch)
-            "the offending patch is carried in ex-data for attribution")
-        (is (contains? (ex-data ex) :line)
-            "and its serialized form, for inspection")
+        (is (= [:bad] (:dj.recorder/edn-path (ex-data ex)))
+            "the structural gate locates the offending leaf by path")
+        (is (contains? (ex-data ex) :value)
+            "and carries the offending value for attribution")
         (is (= before (file-bytes path))
             "the refused append left the log untouched")))
     ;; and the good record alone replays cleanly — the reject wrote nothing.

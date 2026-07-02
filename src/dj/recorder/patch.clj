@@ -22,6 +22,47 @@
   sets and bulk). `#dj.recorder/splice` does ordered positional vector
   edits (insert / delete / range-replace).
 
+  ALPHA DECISIONS pinned in this file (each marked [Dn] at its site):
+
+  [D1] Inline vector indices are ORIGINAL-relative, always. Within one patch
+       map, index *edits* apply first (edits never shift a vector), then index
+       *tombstones* apply deferred, highest-first — so `{1 dissoc-kw,
+       3 dissoc-kw}` removes original elements 1 and 3, independent of map
+       iteration order (which flips at 8 keys, array-map -> hash-map). Same
+       mental model as splice: everything in one patch addresses the vector
+       you started with.
+  [D2] Splice hunks must be non-overlapping AND have distinct `:at` values
+       (two inserts at the same point have no defined order). All hunks are
+       validated with data-carrying ex-infos before any edit is applied.
+  [D3] Removing a record's *basis* key (inline tombstone or `Dissoc` op)
+       throws — `clojure.core/dissoc` would silently degrade the record to a
+       plain map, a type change the caller never asked for. Extension keys
+       dissoc fine.
+  [D4] Patches must be plain, replayable EDN. `assert-edn!` (below) enforces
+       this; the storage append path MUST call it before writing, so a bad
+       patch fails its tx promise instead of poisoning the log. Whitelist:
+       nil/booleans/numbers/strings/chars/keywords/symbols, java.util.Date
+       (#inst) and java.util.UUID (#uuid) — both round-trip through
+       clojure.edn's default readers — the three marker records, and
+       collections thereof. All other records/objects are rejected, INCLUDING
+       record patches (record values in *state* are fine to merge into, but a
+       record used *as a patch* would hit the log as an unreadable tag).
+       Storage must also pin *print-length*/*print-level* to nil around
+       `pr-str` or a dev REPL setting truncates the log.
+  [D5] Seq/list patches append into a fully-realized PersistentList — no
+       nested lazy `concat` (a stack bomb after enough patches, and a lazy
+       value has no place in durable state). Cost is O(n) per append; prefer
+       vectors for anything that grows.
+  [D6] `:dj.recorder/dissoc` is RESERVED as a *map-value* in patches (that is
+       its only special position — as a set/vector/list element, a map key,
+       or a leaf under #dj.recorder/replace it is ordinary data). Storing it
+       verbatim at a map key requires `#dj.recorder/replace`; `update-in`'s
+       leaf-patch does this for you.
+  [D7] Merging a map patch onto nil ALWAYS builds a map, even with integer
+       keys (assoc-in parity) — `update-in` through a missing vector does not
+       conjure a vector. Seed the vector first (or #dj.recorder/replace it).
+       Editing a vector at index = count appends (assoc parity).
+
   Authoring helpers (§ end) build patches for the two cases hand-nesting is
   tedious: `update-in` (read-modify-write a deep leaf) and `move` (relocate a
   vector element). Both shadow nothing you'd want unqualified — call them
@@ -41,7 +82,8 @@
 ;; Inline tombstone: a *value* of this keyword in a merge map deletes that
 ;; key (map) or that index (vector). Same concept as the `Dissoc` op form,
 ;; spelled ergonomically for "update some keys, delete others" in one map.
-(def ^:const dissoc-kw :dj.recorder/dissoc)
+;; Reserved in map-value position only ([D6]).
+(def dissoc-kw :dj.recorder/dissoc)
 
 ;; ---------------------------------------------------------------------------
 ;; Reader fns (referenced by resources/data_readers.clj for the Clojure
@@ -62,6 +104,12 @@
 ;; ---------------------------------------------------------------------------
 ;; print-method: round-trip a marker back to its tagged literal so the log
 ;; is the inspectable, re-readable EDN we advertise.
+;;
+;; NOTE for the storage append path: print-method honors *print-length* /
+;; *print-level*. `pr-str` binds only *print-readably* — the writer must pin
+;; both vars to nil (e.g. `(binding [*print-length* nil *print-level* nil]
+;; (pr-str patch))`) or a REPL-configured truncation silently corrupts the
+;; log ([D4]).
 ;; ---------------------------------------------------------------------------
 
 (defmethod print-method Replace [x ^java.io.Writer w]
@@ -77,6 +125,64 @@
   (print-method (:hunks x) w))
 
 ;; ---------------------------------------------------------------------------
+;; EDN-safety gate ([D4]).
+;; ---------------------------------------------------------------------------
+
+(defn- marker? [x]
+  (or (instance? Replace x) (instance? Dissoc x) (instance? Splice x)))
+
+(defn- edn-atom?
+  "A leaf value that survives pr-str -> clojure.edn/read unchanged (modulo
+  #inst reading back as java.util.Date, which IS java.util.Date here)."
+  [x]
+  (or (nil? x)
+      (boolean? x)
+      (number? x)        ; longs, doubles (##Inf/##NaN incl.), BigInt/BigDecimal, ratios
+      (string? x)
+      (char? x)
+      (keyword? x)
+      (symbol? x)
+      (instance? java.util.Date x)   ; prints #inst, edn default reader
+      (uuid? x)))                    ; prints #uuid, edn default reader
+
+(defn assert-edn!
+  "Throw an ex-info if `p` contains anything that will not round-trip through
+  the log's `pr-str` -> `clojure.edn/read` cycle ([D4]) — records other than
+  the three markers, arbitrary Java objects, functions, etc. The ex-data
+  carries `:dj.recorder/edn-path` (a get-in-style path into the patch; marker
+  contents appear under :value / :coll / :hunks) and the offending `:value`,
+  so a failed tx promise points at the exact leaf. Returns `p` unchanged, so
+  the storage append path can thread it: `(append! (assert-edn! patch))`.
+
+  Deliberately called at APPEND time, not apply time: the live fold could
+  digest these values fine — the corruption would only surface on rehydrate,
+  the worst possible moment."
+  [p]
+  (letfn [(walk! [x path]
+            (cond
+              (edn-atom? x) nil
+              (instance? Replace x) (walk! (:value x) (conj path :value))
+              (instance? Dissoc x)  (walk! (:coll x)  (conj path :coll))
+              (instance? Splice x)  (walk! (:hunks x) (conj path :hunks))
+              ;; record check BEFORE map? — records are map?
+              (record? x)
+              (throw (ex-info "dj.recorder: record in patch — records don't round-trip the EDN log; patch with a plain map (merges into a record value fine) or #dj.recorder/replace a plain-data representation"
+                              {:dj.recorder/edn-path path :value x}))
+              (map? x) (doseq [[k v] x]
+                         (walk! k (conj path k))   ; keys must be EDN too
+                         (walk! v (conj path k)))
+              (or (vector? x) (set? x) (seq? x))
+              (doseq [[i el] (map-indexed vector x)]
+                (walk! el (conj path i)))
+              :else
+              (throw (ex-info "dj.recorder: non-EDN value in patch — it cannot be replayed from the log"
+                              {:dj.recorder/edn-path path
+                               :value x
+                               :type (class x)}))))]
+    (walk! p [])
+    p))
+
+;; ---------------------------------------------------------------------------
 ;; The algebra
 ;; ---------------------------------------------------------------------------
 
@@ -85,44 +191,103 @@
 (defn- vec-remove [v i]
   (into (subvec v 0 i) (subvec v (inc i))))
 
+(defn- dissoc-guarded
+  "`dissoc` that refuses to degrade a record to a plain map ([D3]): removing
+  a basis key throws; extension keys and plain maps dissoc normally."
+  [m k]
+  (let [out (dissoc m k)]
+    (if (and (record? m) (not (record? out)))
+      (throw (ex-info "dj.recorder: dissoc of a record basis key would degrade the record to a map; #dj.recorder/replace the whole value instead"
+                      {:key k :value m}))
+      out)))
+
+(defn- validate-hunks!
+  "Structural + bounds check for splice hunks against the target vector `v`
+  ([D2]). Every hunk: integer `:at` >= 0, integer `:-` >= 0, sequential `:+`.
+  Sorted by `:at`: extents must not overlap, `:at` values must be distinct,
+  and the furthest extent must fit in `v`. Fail-loud with data before any
+  edit is applied."
+  [v hunks]
+  (let [norm   (mapv (fn [h]
+                       (let [{:keys [at] rm :- ins :+ :or {rm 0 ins []}} h]
+                         (when-not (and (integer? at) (<= 0 at)
+                                        (integer? rm) (<= 0 rm)
+                                        (sequential? ins))
+                           (throw (ex-info "dj.recorder: malformed splice hunk (want {:at nat-int, :- nat-int, :+ sequential})"
+                                           {:hunk h :hunks hunks})))
+                         {:at at :rm rm}))
+                     hunks)
+        sorted (sort-by :at norm)]
+    (doseq [[{a1 :at r1 :rm :as h1} {a2 :at :as h2}] (partition 2 1 sorted)]
+      (when (or (= a1 a2) (> (+ a1 r1) a2))
+        (throw (ex-info "dj.recorder: splice hunks overlap or share an :at (order would be ambiguous)"
+                        {:hunk-a h1 :hunk-b h2 :hunks hunks}))))
+    (when-let [{a :at r :rm} (last sorted)]
+      (when (> (+ a r) (count v))
+        (throw (ex-info "dj.recorder: splice hunk extends past end of vector"
+                        {:at a :- r :count (count v) :hunks hunks}))))))
+
 (defn- apply-splice
   "Apply ordered unix-hunk-style edits to a vector (sketch §1b). Each hunk:
   {:at i :- n :+ [..]} — start index into the ORIGINAL vector, count removed,
-  elements inserted. Hunks must not overlap; applied descending by `:at` so
-  lower indices never need rebasing."
+  elements inserted. Hunks are validated (non-overlapping, distinct :at, in
+  bounds — [D2]) then applied descending by `:at` so lower indices never need
+  rebasing."
   [v hunks]
   (when-not (vector? v)
     (throw (ex-info "#dj.recorder/splice requires a vector" {:value v :hunks hunks})))
+  (validate-hunks! v hunks)
   (reduce (fn [acc {:keys [at] rm :- ins :+ :or {rm 0 ins []}}]
             (-> (subvec acc 0 at)
                 (into ins)
                 (into (subvec acc (+ at rm)))))
           v
-          (sort-by :at > hunks)))   ; high index first -> prefix stays valid
+          (sort-by :at #(compare %2 %1) hunks)))  ; high index first -> prefix stays valid
 
 (defn- apply-map
   "Merge a plain map/record patch `p` into `v` (markers already dispatched in
   `apply-patch`, so `p` here is data). Recurse per key; a value of `dissoc-kw`
-  removes that key (map/record) or index (vector, shifts the tail); a value of
-  nil leaves the key untouched — present or absent (the identity patch, Option
-  1; use #dj.recorder/replace nil to store a literal nil)."
+  removes that key (map/record) or index (vector); a value of nil leaves the
+  key untouched — present or absent (the identity patch, Option 1; use
+  #dj.recorder/replace nil to store a literal nil).
+
+  [D1]: against a vector, ALL keys are original-relative. Two phases: edits
+  first (assoc never shifts), then tombstones deferred and applied
+  highest-index-first — so multiple deletes, or a delete alongside an edit,
+  are deterministic and mean what they said, independent of map iteration
+  order. Vector index edits accept 0..count (index = count appends, assoc
+  parity); tombstone indices must be 0..count-1."
   [v p]
   (when-not (or (nil? v) (associative? v))
     (throw (ex-info "cannot merge a map-patch into a non-associative value; use #dj.recorder/replace for a shape change"
                     {:value v :patch p})))
-  (reduce-kv
-   (fn [acc k pv]
-     (cond
-       ;; nil sub-patch = no change to this key (don't touch it, don't add it).
-       (nil? pv)        acc
-       (= pv dissoc-kw)
-       (cond
-         (vector? acc)      (vec-remove acc k)   ; k = integer index (shifts tail)
-         (associative? acc) (dissoc acc k)       ; map or record key
-         :else (throw (ex-info "inline dissoc target not associative" {:key k :value acc})))
-       :else (assoc acc k (apply-patch (get acc k) pv)))) ; assoc preserves record/vector type
-   (or v {})
-   p))
+  (let [p      (if (record? p) (into {} p) p)  ; reduce-kv on records needs 1.11+; cheap to not care
+        edited (reduce-kv
+                (fn [acc k pv]
+                  (cond
+                    ;; nil sub-patch = no change to this key (don't touch it, don't add it).
+                    (nil? pv)        acc
+                    ;; tombstones deferred to phase 2 ([D1]).
+                    (= pv dissoc-kw) acc
+                    :else
+                    (do (when (and (vector? acc)
+                                   (not (and (integer? k) (<= 0 k (count acc)))))
+                          (throw (ex-info "dj.recorder: vector patch key must be an index in 0..count (= count appends)"
+                                          {:key k :count (count acc) :patch p})))
+                        ;; assoc preserves record/vector type
+                        (assoc acc k (apply-patch (get acc k) pv)))))
+                (or v {})    ; map onto nil always builds a map, int keys incl. ([D7])
+                p)
+        tombs  (keep (fn [[k pv]] (when (= pv dissoc-kw) k)) p)]
+    (if (vector? edited)
+      (do (doseq [k tombs]
+            (when-not (and (integer? k) (< -1 k (count edited)))
+              (throw (ex-info "dj.recorder: inline dissoc index out of bounds for vector"
+                              {:key k :count (count edited) :patch p}))))
+          (reduce vec-remove edited (sort #(compare %2 %1) tombs)))  ; high first ([D1])
+      (if (associative? edited)
+        (reduce dissoc-guarded edited tombs)   ; map or record key ([D3])
+        (throw (ex-info "inline dissoc target not associative" {:keys (vec tombs) :value edited}))))))
 
 (defn apply-patch
   "Apply patch `p` to current value `v`, returning the new value. The single
@@ -133,14 +298,14 @@
     ;; nil is the identity patch: no change (Option 1). NOT a value to store
     ;; and NOT a delete — store a literal nil with #dj.recorder/replace nil,
     ;; remove with dissoc. This makes a state->patch fn returning nil (the
-    ;; natural \"skip\" reflex) a safe no-op instead of nuking the root.
+    ;; natural "skip" reflex) a safe no-op instead of nuking the root.
     (nil? p)              v
     ;; markers first — they are also map?
     (instance? Replace p) (:value p)
     (instance? Dissoc p)  (let [c (:coll p)]
                             (cond
                               (set? v) (reduce disj v c)
-                              (map? v) (reduce dissoc v c)
+                              (map? v) (reduce dissoc-guarded v c)   ; record-safe ([D3])
                               :else (throw (ex-info "#dj.recorder/dissoc requires a map or set"
                                                     {:value v :coll c}))))
     (instance? Splice p)  (apply-splice v (:hunks p))
@@ -154,7 +319,10 @@
                     (into (or v []) p))          ; concat
     (seq? p)    (do (when-not (or (nil? v) (seq? v))
                       (throw (ex-info "list-patch requires a list/seq or nil" {:value v :patch p})))
-                    (concat (or v ()) p))        ; lists/seqs -> append
+                    ;; realized PersistentList, not nested lazy concat ([D5]):
+                    ;; O(n) per append, but no stack bomb and no laziness in
+                    ;; durable state. Prefer vectors for growing collections.
+                    (apply list (concat (or v ()) p)))
     :else       p))                              ; non-nil scalar -> replace the leaf
 
 (defn rehydrate
@@ -179,11 +347,11 @@
   "A patch fragment that REPLACES a leaf with `v` (so these helpers match
   `clojure.core/update-in`/`move` semantics — they overwrite the target, they
   do not additively merge into it). Scalars already replace under the algebra,
-  so they pass through bare (keeps the log clean); collections, records, and
-  nil must be wrapped in `#dj.recorder/replace` or they'd merge / union /
-  concat (or, for nil, no-op) instead of overwriting."
+  so they pass through bare (keeps the log clean); collections, records, nil —
+  and the reserved tombstone keyword itself, which bare would DELETE the key
+  ([D6]) — must be wrapped in `#dj.recorder/replace` to store verbatim."
   [v]
-  (if (or (nil? v) (coll? v)) (->Replace v) v))
+  (if (or (nil? v) (coll? v) (= v dissoc-kw)) (->Replace v) v))
 
 (defn- nest
   "Place a leaf patch fragment `frag` at `path` within an otherwise-empty
@@ -202,7 +370,9 @@
   literal; collection/nil results are wrapped in `#dj.recorder/replace`.
 
   Meant for use inside a `tx!` authoring fn so `s` is the dispatch-thread
-  state (race-free). `path` may be empty to update the root."
+  state (race-free). `path` may be empty to update the root. Note the patch
+  merges through *maps* on the way down ([D7]) — a path through a missing
+  intermediate creates maps, never vectors (assoc-in parity)."
   [s path f & args]
   (nest path (leaf-patch (apply f (get-in s path) args))))
 

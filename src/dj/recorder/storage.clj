@@ -24,12 +24,14 @@
   Log format: one patch per line, `(pr-str patch)` + \\n, UTF-8. With
   `*print-readably*` pinned true (see `append!`), pr-str escapes embedded
   newlines in strings, so a record is always exactly one physical line and
-  the \\n is a reliable record delimiter. Every record is verified to
-  round-trip through our own EDN reader *before* it touches the file — a
-  non-EDN value (a function, an atom, a `#object[...]`) is refused at
-  `append!` with the offending patch in ex-data, instead of being written
-  and misread later. The marker records (patch ns) print as their tagged
-  literals and re-read via `patch/data-readers`."
+  the \\n is a reliable record delimiter. Every record passes two gates
+  *before* it touches the file: `patch/assert-edn!` (the structural whitelist —
+  records-used-as-patch, live objects, functions are rejected with a path to
+  the offending leaf, [D4]), then a serialize-and-reparse round-trip through
+  our own EDN reader as a backstop. A non-EDN value (a function, an atom, a
+  `#object[...]`) is refused at `append!` instead of being written and misread
+  later. The marker records (patch ns) print as their tagged literals and
+  re-read via `patch/data-readers`."
   (:require [clojure.java.io :as io]
             [clojure.edn :as edn]
             [dj.recorder.patch :as patch])
@@ -97,6 +99,14 @@
     (reify
       AppendLog
       (append! [_ patch]
+        ;; Structural EDN gate ([D4]): reject records-used-as-patch, live
+        ;; objects, functions — anything outside patch's replayable-EDN
+        ;; whitelist — BEFORE serializing, with a `:dj.recorder/edn-path` to
+        ;; the offending leaf. Throws (log untouched) on failure; the
+        ;; serialize-and-reparse `assert-round-trips!` below is the remaining
+        ;; backstop against a print-method/reader bug on an otherwise-whitelisted
+        ;; value.
+        (patch/assert-edn! patch)
         ;; Pin EVERY print var the one-line/readable invariant depends on —
         ;; not just the truncating ones. A caller's ambient *print-length*/
         ;; *print-level* could truncate a large structure into `...`; a falsey

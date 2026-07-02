@@ -46,12 +46,32 @@
   ;; I. in-place update via integer-keyed map (recurse into index 0)
   (is (= [{:name "Alice"} {:name "Carol"}]
          (p/apply-patch [{:name "Bob"} {:name "Carol"}] {0 {:name "Alice"}})))
-  ;; I2. index removal (shifts the tail) — symmetric with map-key dissoc
+  ;; I2. index removal — symmetric with map-key dissoc
   (is (= [10 30] (p/apply-patch [10 20 30] {1 DISS})))
   ;; J. replace the whole vector (escape; shrink/rewrite)
   (is (= [9] (p/apply-patch [1 2 3] (p/read-replace [9]))))
   ;; concat onto nil
   (is (= [1 2] (p/apply-patch nil [1 2]))))
+
+(deftest vector-inline-original-relative
+  ;; [D1]: within one patch map, ALL vector keys address the ORIGINAL vector.
+  ;; Two-phase — edits (assoc, never shift) first, then tombstones deferred and
+  ;; applied highest-index-first — so the result is independent of map
+  ;; iteration order (which flips array-map -> hash-map at 8 keys).
+  (testing "multiple tombstones remove the original elements they named"
+    (is (= [10 30] (p/apply-patch [10 20 30 40] {1 DISS 3 DISS})))     ; drop orig 1 & 3
+    (is (= [:b :d] (p/apply-patch [:a :b :c :d :e] {0 DISS 2 DISS 4 DISS}))))
+  (testing "a delete alongside an edit: both original-relative, deterministic"
+    ;; edit index 0, delete index 1 — the edit is NOT rebased by the delete
+    (is (= [:A :c] (p/apply-patch [:a :b :c] {0 :A 1 DISS}))))
+  (testing "an 8+-key patch (hash-map iteration order) still means what it said"
+    (let [v (vec (range 10))
+          p (into {} (for [i (range 10)] [i (if (even? i) DISS i)]))]  ; drop evens
+      (is (= [1 3 5 7 9] (p/apply-patch v p)))))
+  (testing "[D7] index = count appends (assoc parity); past-count / tombstone OOB throw"
+    (is (= [10 20 99] (p/apply-patch [10 20] {2 99})))                 ; index=count appends
+    (is (thrown? clojure.lang.ExceptionInfo (p/apply-patch [10 20] {5 99})))
+    (is (thrown? clojure.lang.ExceptionInfo (p/apply-patch [10 20] {2 DISS})))))
 
 (deftest splices
   ;; I3. pure insert at index 1 (shifts the tail)
@@ -71,10 +91,34 @@
          (p/apply-patch [0 1 2 3 4]
                         (p/read-splice [{:at 3 :+ [:b]} {:at 1 :- 1 :+ [:a]}])))))
 
+(deftest splice-validation
+  ;; [D2]: hunks are validated (structure, non-overlap, distinct :at, bounds)
+  ;; BEFORE any edit is applied — fail loud with data, never a partial write.
+  (testing "overlapping remove-extents throw"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (p/apply-patch [0 1 2 3] (p/read-splice [{:at 0 :- 2} {:at 1 :+ [:x]}])))))
+  (testing "two hunks sharing an :at throw (insert order would be ambiguous)"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (p/apply-patch [0 1 2] (p/read-splice [{:at 1 :+ [:x]} {:at 1 :+ [:y]}])))))
+  (testing "a hunk extending past the end throws"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (p/apply-patch [0 1] (p/read-splice [{:at 1 :- 5}])))))
+  (testing "malformed hunk (negative / non-sequential :+) throws"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (p/apply-patch [0 1] (p/read-splice [{:at -1 :+ [:x]}]))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (p/apply-patch [0 1] (p/read-splice [{:at 0 :+ 5}])))))
+  (testing "a pure insert AT the end (:at = count, zero-width) is legal"
+    (is (= [0 1 :x] (p/apply-patch [0 1] (p/read-splice [{:at 2 :+ [:x]}]))))))
+
 (deftest lists-seqs
   ;; H2. a seq serializes to a list; list patch concats (same rule as vectors)
   (is (= '(1 2 3 4 5) (p/apply-patch '(1 2 3) '(4 5))))
-  (is (= '(1 2) (p/apply-patch nil '(1 2)))))
+  (is (= '(1 2) (p/apply-patch nil '(1 2))))
+  ;; [D5]: the result is a fully-realized PersistentList, not a lazy concat —
+  ;; no stack bomb after many appends, no laziness in durable state.
+  (is (instance? clojure.lang.PersistentList (p/apply-patch '(1 2 3) '(4 5))))
+  (is (not (instance? clojure.lang.LazySeq (p/apply-patch '(1) '(2))))))
 
 (defrecord Person [name age])
 
@@ -82,7 +126,20 @@
   ;; R. record carries map semantics: untagged patch merges, type preserved
   (let [result (p/apply-patch (->Person "Bob" 30) {:age 31})]
     (is (= (->Person "Bob" 31) result))
-    (is (instance? Person result) "record type is preserved through merge")))
+    (is (instance? Person result) "record type is preserved through merge"))
+  ;; [D3]: dissoc of a basis key would silently degrade the record to a plain
+  ;; map — a type change the caller never asked for — so it throws (inline
+  ;; tombstone AND op form). Extension keys dissoc fine.
+  (testing "dissoc of a basis key throws (inline + op form)"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (p/apply-patch (->Person "Bob" 30) {:age DISS})))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (p/apply-patch (->Person "Bob" 30) (p/read-dissoc [:age])))))
+  (testing "dissoc of an extension key is fine and keeps the record type"
+    (let [r      (assoc (->Person "Bob" 30) :nick "B")
+          result (p/apply-patch r {:nick DISS})]
+      (is (= (->Person "Bob" 30) result))
+      (is (instance? Person result) "extension-key dissoc preserves the record"))))
 
 (deftest scalars-and-root
   ;; K. a scalar patch overwrites a scalar root
@@ -130,6 +187,51 @@
              {:user (p/read-replace {:x 1}) :tags (p/read-dissoc #{:old})}]]
     (is (= x (edn/read-string {:readers p/data-readers} (pr-str x)))
         (str "round-trip: " (pr-str x)))))
+
+(deftest assert-edn!-gate
+  ;; [D4]: the append-time gate. Plain replayable EDN (incl. the markers, #inst
+  ;; Date, #uuid) passes and returns the patch unchanged; anything that would
+  ;; not round-trip through pr-str -> clojure.edn/read is rejected with a path.
+  (testing "whitelisted patches pass and return unchanged (threadable)"
+    (doseq [p [{:a 1 :b "s" :c :kw 'sym true}
+               {:when #inst "2026-07-02T00:00:00.000-00:00"}   ; Date, #inst
+               {:id #uuid "00000000-0000-0000-0000-000000000000"}
+               {:user (p/read-replace {:x 1})
+                :tags (p/read-dissoc #{:old})
+                :xs   (p/read-splice [{:at 1 :- 1 :+ [:a :b]}])}
+               [1 2 #{:x} '(:y)]]]
+      (is (identical? p (p/assert-edn! p)) (str "passes: " (pr-str p)))))
+  (testing "a record USED AS a patch is rejected — records don't round-trip"
+    (let [ex (try (p/assert-edn! {:who (->Person "Bob" 30)}) nil
+                  (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? ex))
+      (is (= [:who] (:dj.recorder/edn-path (ex-data ex))))))
+  (testing "a record nested inside a marker is still found (path threads in)"
+    (let [ex (try (p/assert-edn! {:u (p/read-replace (->Person "A" 1))}) nil
+                  (catch clojure.lang.ExceptionInfo e e))]
+      (is (= [:u :value] (:dj.recorder/edn-path (ex-data ex)))
+          "marker contents are walked under :value")))
+  (testing "a non-EDN leaf (fn) is rejected with its path"
+    (let [ex (try (p/assert-edn! {:xs [0 (fn [] 1)]}) nil
+                  (catch clojure.lang.ExceptionInfo e e))]
+      (is (= [:xs 1] (:dj.recorder/edn-path (ex-data ex))))))
+  (testing "map KEYS are walked too — a java.io.File key would corrupt the log"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (p/assert-edn! {(java.io.File. "/tmp/x") 1}))))
+  (testing "Instant is NOT whitelisted (edn reads #inst back as Date — a type divergence)"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (p/assert-edn! {:t (java.time.Instant/ofEpochMilli 0)})))))
+
+(deftest leaf-patch-tombstone-kw
+  ;; [D6]: update-in's result being the reserved tombstone keyword must store
+  ;; it verbatim (wrapped in #replace), NOT delete the key.
+  (testing "an update-in that produces dissoc-kw stores it literally"
+    (let [s     {:a 1}
+          patch (p/update-in s [:a] (constantly p/dissoc-kw))]
+      (is (= {:a p/dissoc-kw} (p/apply-patch s patch)) "key set to the literal keyword, not removed")
+      ;; and it survives the log round-trip as a #replace, not a bare tombstone
+      (is (= (p/apply-patch s patch)
+             (p/apply-patch s (edn/read-string {:readers p/data-readers} (pr-str patch))))))))
 
 (deftest end-to-end-edn-log-replay
   ;; Simulate the full disk path: print each patch, read it back, fold it.

@@ -49,6 +49,12 @@
        record used *as a patch* would hit the log as an unreadable tag).
        Storage must also pin *print-length*/*print-level* to nil around
        `pr-str` or a dev REPL setting truncates the log.
+       CAVEAT (decided: backstop is enough): the #inst textual round-trip only
+       holds for 4-digit years (0001–9999); an extreme java.util.Date prints a
+       wider year that clojure.edn's reader then rejects. This gate does NOT
+       narrow the Date range — such a Date is instead refused at append by
+       storage's serialize-and-reparse round-trip check, so it never reaches the
+       log (the tx fails loudly). A rare edge the two-gate design already covers.
   [D5] Seq/list patches append into a fully-realized PersistentList — no
        nested lazy `concat` (a stack bomb after enough patches, and a lazy
        value has no place in durable state). Cost is O(n) per append; prefer

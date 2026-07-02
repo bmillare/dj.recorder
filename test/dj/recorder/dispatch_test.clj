@@ -30,7 +30,7 @@
           r2 @(d/submit! core (fn [s] {:user {:age (if (:user s) 31 0)}}))]
       (is (= {:user {:name "Bob"}} r1) "promise resolves to the new realized state")
       (is (= {:user {:name "Bob" :age 31}} r2) "additive merge; authoring fn read prior state")
-      (is (= {:user {:name "Bob" :age 31}} (d/state core)) "@db reflects the latest write")
+      (is (= {:user {:name "Bob" :age 31}} @core) "@db reflects the latest write")
       ;; persist-then-publish: exactly the authored patches hit the log, in order.
       (is (= [{:user {:name "Bob"}} {:user {:age 31}}] @log)))))
 
@@ -55,7 +55,7 @@
       (is (= {:items 5} bad))
       (is (instance? Throwable err) "the bad patch is rejected via the promise")
       (is (= {:items 7} ok) "the drainer kept going to the next tx")
-      (is (nil? (d/halted core)) "a patch error does NOT halt the core")
+      (is (nil? (d/error core)) "a patch error does NOT halt the core")
       (is (= [{:items (p/read-replace 5)} {:items 7}] @log)
           "only the successful txs persisted; the rejected one did not"))))
 
@@ -67,8 +67,8 @@
       (is (instance? Throwable r2) "the failing tx's promise carries the I/O error")
       (is (instance? java.io.IOException r2)))
     (testing "the core is halted: reads still work, writes throw (§5/§9)"
-      (is (= {:a 1} (d/state core)) "reads return the last good state")
-      (is (some? (d/halted core)) "halted flag set to the I/O cause")
+      (is (= {:a 1} @core) "reads return the last good state")
+      (is (some? (d/error core)) "halted flag set to the I/O cause")
       (is (thrown? clojure.lang.ExceptionInfo
                    (d/submit! core (fn [_] {:c 3}))) "further writes throw"))))
 
@@ -96,16 +96,16 @@
       (is (instance? Throwable @p1) "the failing tx is rejected")
       (is (instance? Throwable @p2) "a pending tx is rejected on halt, not stranded")
       (is (instance? Throwable @p3) "...and so is the one behind it")
-      (is (some? (d/halted core))))))
+      (is (some? (d/error core))))))
 
-(deftest await-drained-blocks-until-empty
+(deftest await-blocks-until-empty
   (let [{:keys [log append!]} (recording-append)
         slow-append (fn [patch] (Thread/sleep 2) (append! patch))
         core (d/make-core {} slow-append)]
     (dotimes [i 20] (d/submit! core (fn [_] {(keyword (str "k" i)) i})))
-    (d/await-drained core)
+    (d/await core)
     (is (= 20 (count @log)) "await returns only after all queued txs drained")
-    (is (= 20 (count (d/state core))))))
+    (is (= 20 (count @core)))))
 
 (deftest fifo-order-under-concurrency
   ;; Many submitters from many threads; the single drainer must serialize them
@@ -120,11 +120,11 @@
                       ^Runnable (fn [] (d/submit! core (fn [_] {:seq [i]})))))
                    (range n))]
     (run! #(.join ^Thread %) ths)
-    (d/await-drained core)
+    (d/await core)
     (is (= n (count @log)) "every submitted tx was processed exactly once")
-    (is (= (set (range n)) (set (:seq (d/state core))))
+    (is (= (set (range n)) (set (:seq @core)))
         "all indices present, none lost or duplicated")
-    (is (= n (count (:seq (d/state core)))))))
+    (is (= n (count (:seq @core))))))
 
 (deftest integrates-with-real-storage
   ;; The drainer's append! is the real file writer; after draining, an
@@ -137,8 +137,8 @@
         @(d/submit! core (fn [_] {:user {:age 30}}))
         @(d/submit! core (fn [_] {:tags #{:a :b}}))
         @(d/submit! core (fn [_] {:tags (p/read-dissoc #{:a})}))
-        (d/await-drained core)
-        (let [in-mem (d/state core)
+        (d/await core)
+        (let [in-mem @core
               on-disk (:state (s/read-log {} path))]
           (is (= {:user {:name "Bob" :age 30} :tags #{:b}} in-mem))
           (is (= in-mem on-disk) "rehydrate from disk matches the live state"))))))

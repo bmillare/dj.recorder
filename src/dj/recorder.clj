@@ -50,11 +50,11 @@
 
 (deftype Recorder [core writer lock path a-closed]
   clojure.lang.IDeref
-  (deref [_] (dispatch/state core)))
+  (deref [_] @core))
 
 (defmethod print-method Recorder [^Recorder db ^java.io.Writer w]
   (.write w (str "#dj.recorder/db " (pr-str {:path (.-path db)
-                                             :halted? (some? (dispatch/halted (.-core db)))
+                                             :halted? (some? (dispatch/error (.-core db)))
                                              :closed? @(.-a-closed db)}))))
 
 ;; ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@
   "Block until every change enqueued before this call has been processed
   (agent-style `await`; the read-your-writes barrier — §3). Returns nil."
   [^Recorder db]
-  (dispatch/await-drained (.-core db))
+  (dispatch/await (.-core db))
   nil)
 
 (defn halted
@@ -192,7 +192,7 @@
   live (§5). A halted db is still `deref`-able but rejects writes; recover by
   `close!` + re-`open`."
   [^Recorder db]
-  (dispatch/halted (.-core db)))
+  (dispatch/error (.-core db)))
 
 (defn close!
   "Drain in-flight work, close the writer, and release the single-writer lock
@@ -201,7 +201,7 @@
   immutable view of its last state — durable2's close-flag model). Returns nil."
   [^Recorder db]
   (when (compare-and-set! (.-a-closed db) false true)
-    (dispatch/await-drained (.-core db))            ; let queued writes complete
+    (dispatch/await (.-core db))                    ; let queued writes complete
     (.close ^java.lang.AutoCloseable (.-writer db))
     (.unlock ^Lock (.-lock db)))
   nil)

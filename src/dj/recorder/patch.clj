@@ -12,67 +12,54 @@
     map / record -> merge keys (recurse)      set    -> union
     vector       -> concat (append)           list   -> concat (append)
     scalar       -> replace (nothing to add)  nil    -> NO CHANGE (identity)
-  `nil` is the identity patch everywhere — a no-op (Option 1). It is neither a
-  value to store nor a delete, so a `state->patch` fn that returns nil (the
-  natural \"skip\" reflex) is a safe no-op instead of nuking the root. The three
-  intents are now distinct and explicit: store a literal nil with
+  `nil` is the identity patch everywhere — a no-op. It is neither a value to
+  store nor a delete, so a `state->patch` fn that returns nil (the natural
+  \"skip\" reflex) is a safe no-op instead of nuking the root. The three
+  intents are distinct and explicit: store a literal nil with
   `#dj.recorder/replace nil`; remove a key with `dissoc`; \"no change\" is nil.
   Two escapes: `#dj.recorder/replace x` overwrites; `dissoc` removes
   (inline keyword tombstone for map keys / vector indices, op form for
   sets and bulk). `#dj.recorder/splice` does ordered positional vector
   edits (insert / delete / range-replace).
 
-  ALPHA DECISIONS pinned in this file (each marked [Dn] at its site):
+  Design decisions are marked [Dn] at their code sites; each rule below, with
+  the fuller mechanism at the site and the rationale in the sketch + watson
+  RI 31:
 
-  [D1] Inline vector indices are ORIGINAL-relative, always. Within one patch
-       map, index *edits* apply first (edits never shift a vector), then index
-       *tombstones* apply deferred, highest-first — so `{1 dissoc-kw,
-       3 dissoc-kw}` removes original elements 1 and 3, independent of map
-       iteration order (which flips at 8 keys, array-map -> hash-map). Same
-       mental model as splice: everything in one patch addresses the vector
-       you started with.
-  [D2] Splice hunks must be non-overlapping AND have distinct `:at` values
-       (two inserts at the same point have no defined order). All hunks are
-       validated with data-carrying ex-infos before any edit is applied.
-  [D3] Removing a record's *basis* key (inline tombstone or `Dissoc` op)
-       throws — `clojure.core/dissoc` would silently degrade the record to a
-       plain map, a type change the caller never asked for. Extension keys
-       dissoc fine.
-  [D4] Patches must be plain, replayable EDN. `assert-edn!` (below) enforces
-       this; the storage append path MUST call it before writing, so a bad
-       patch fails its tx promise instead of poisoning the log. Whitelist:
+  [D1] Inline vector indices are ORIGINAL-relative: within one patch map, edits
+       apply first (never shifting the vector), then tombstones highest-index
+       first — so a patch always addresses the vector you started with,
+       independent of map iteration order. (apply-map)
+  [D2] Splice hunks must be non-overlapping and have distinct `:at`; all hunks
+       are validated fail-loud before any edit is applied. (validate-hunks!)
+  [D3] Dissoc of a record's *basis* key throws (it would silently degrade the
+       record to a plain map); extension keys dissoc fine. (dissoc-guarded)
+  [D4] Patches must be plain, replayable EDN — `assert-edn!` enforces it and
+       the storage append path calls it before writing. Whitelist:
        nil/booleans/numbers/strings/chars/keywords/symbols, java.util.Date
-       (#inst) and java.util.UUID (#uuid) — both round-trip through
-       clojure.edn's default readers — the three marker records, and
+       (#inst) and java.util.UUID (#uuid), the three marker records, and
        collections thereof. All other records/objects are rejected, INCLUDING
-       record patches (record values in *state* are fine to merge into, but a
+       record patches (a record value in *state* is fine to merge into; a
        record used *as a patch* would hit the log as an unreadable tag).
-       Storage must also pin *print-length*/*print-level* to nil around
-       `pr-str` or a dev REPL setting truncates the log.
-       CAVEAT (decided: backstop is enough): the #inst textual round-trip only
-       holds for 4-digit years (0001–9999); an extreme java.util.Date prints a
-       wider year that clojure.edn's reader then rejects. This gate does NOT
-       narrow the Date range — such a Date is instead refused at append by
-       storage's serialize-and-reparse round-trip check, so it never reaches the
-       log (the tx fails loudly). A rare edge the two-gate design already covers.
-  [D5] Seq/list patches append into a fully-realized PersistentList — no
-       nested lazy `concat` (a stack bomb after enough patches, and a lazy
-       value has no place in durable state). Cost is O(n) per append; prefer
-       vectors for anything that grows.
-  [D6] `:dj.recorder/dissoc` is RESERVED as a *map-value* in patches (that is
-       its only special position — as a set/vector/list element, a map key,
-       or a leaf under #dj.recorder/replace it is ordinary data). Storing it
-       verbatim at a map key requires `#dj.recorder/replace`; `update-in`'s
-       leaf-patch does this for you.
-  [D7] Merging a map patch onto nil ALWAYS builds a map, even with integer
-       keys (assoc-in parity) — `update-in` through a missing vector does not
-       conjure a vector. Seed the vector first (or #dj.recorder/replace it).
-       Editing a vector at index = count appends (assoc parity).
+       CAVEAT: the #inst textual round-trip only holds for 4-digit years
+       (0001–9999); an extreme java.util.Date is not narrowed here but is
+       refused at append by storage's serialize-and-reparse backstop (the tx
+       fails loudly, nothing reaches the log).
+  [D5] Seq/list patches append into a realized PersistentList — no lazy `concat`
+       stack bomb, no laziness in durable state; O(n) per append, so prefer
+       vectors for anything that grows. (apply-patch)
+  [D6] `:dj.recorder/dissoc` is reserved only as a *map-value* (as a
+       set/vector/list element, a map key, or a leaf under #dj.recorder/replace
+       it is ordinary data); store it verbatim at a key via
+       `#dj.recorder/replace` — `update-in`'s leaf-patch does this. (leaf-patch)
+  [D7] A map patch onto nil always builds a map, even with integer keys
+       (assoc-in parity) — a path through a missing vector does not conjure a
+       vector; seed it first (or #dj.recorder/replace it). Editing a vector at
+       index = count appends (assoc parity). (apply-map / update-in)
 
-  Authoring helpers (§ end) build patches for the two cases hand-nesting is
+  Authoring helpers (below) build patches for the two cases hand-nesting is
   tedious: `update-in` (read-modify-write a deep leaf) and `move` (relocate a
-  vector element). Both shadow nothing you'd want unqualified — call them
-  qualified (`patch/update-in`, `patch/move`)."
+  vector element). Call them qualified (`patch/update-in`, `patch/move`)."
   (:refer-clojure :exclude [update-in]))
 
 ;; ---------------------------------------------------------------------------
@@ -254,7 +241,7 @@
   "Merge a plain map/record patch `p` into `v` (markers already dispatched in
   `apply-patch`, so `p` here is data). Recurse per key; a value of `dissoc-kw`
   removes that key (map/record) or index (vector); a value of nil leaves the
-  key untouched — present or absent (the identity patch, Option 1; use
+  key untouched — present or absent (the identity patch; use
   #dj.recorder/replace nil to store a literal nil).
 
   [D1]: against a vector, ALL keys are original-relative. Two phases: edits
@@ -301,10 +288,10 @@
   type-collision rules; incompatible container merges throw (fail loud)."
   [v p]
   (cond
-    ;; nil is the identity patch: no change (Option 1). NOT a value to store
-    ;; and NOT a delete — store a literal nil with #dj.recorder/replace nil,
-    ;; remove with dissoc. This makes a state->patch fn returning nil (the
-    ;; natural "skip" reflex) a safe no-op instead of nuking the root.
+    ;; nil is the identity patch: no change. NOT a value to store and NOT a
+    ;; delete — store a literal nil with #dj.recorder/replace nil, remove with
+    ;; dissoc. This makes a state->patch fn returning nil (the natural "skip"
+    ;; reflex) a safe no-op instead of nuking the root.
     (nil? p)              v
     ;; markers first — they are also map?
     (instance? Replace p) (:value p)

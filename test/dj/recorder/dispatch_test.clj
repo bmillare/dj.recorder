@@ -126,6 +126,84 @@
         "all indices present, none lost or duplicated")
     (is (= n (count (:seq @core))))))
 
+(deftest await-throws-on-halt
+  ;; await is a barrier that resolves only once all prior work drained; if the
+  ;; core is already halted, or halts before the barrier drains, it THROWS —
+  ;; agent parity with clojure.core/await on a failed agent (§5). A returning
+  ;; await therefore guarantees everything queued before it is durable.
+  (testing "already halted → await throws immediately"
+    (let [core (d/make-core {} (throwing-append 1))]   ; 1st append throws → HALT
+      (is (instance? Throwable @(d/submit! core (fn [_] {:a 1}))) "drive the halt")
+      (is (some? (d/error core)) "precondition: core is halted")
+      (is (thrown? clojure.lang.ExceptionInfo (d/await core))
+          "await on an already-halted core throws the halted ex-info")))
+  (testing "halts under the pending barrier → await throws, does not hang"
+    (let [gate    (atom :wait)
+          start   (promise)
+          append! (fn [_patch]
+                    (deliver start true)
+                    (loop [] (when (= :wait @gate) (Thread/sleep 1) (recur)))
+                    (throw (java.io.IOException. "boom")))
+          core    (d/make-core {} append!)]
+      (d/submit! core (fn [_] {:a 1}))                 ; blocks inside append!
+      @start                                           ; drainer is now in append!
+      (let [awaiter (future (try (d/await core) ::returned
+                                 (catch clojure.lang.ExceptionInfo _ ::threw)))]
+        (Thread/sleep 5)                               ; let the barrier queue behind the tx
+        (reset! gate :fail)                            ; release append! → it throws → HALT
+        (is (= ::threw @awaiter)
+            "an await pending when the core halts throws rather than blocking forever")))))
+
+(deftest stack-overflow-is-a-per-tx-reject
+  ;; A StackOverflowError arrives with the stack already unwound: a runaway
+  ;; patch-fn is a user-code verdict, rejected per-tx like any authoring error —
+  ;; the drainer keeps going and the core is NOT halted (§5).
+  (let [{:keys [log append!]} (recording-append)
+        core (d/make-core {} append!)
+        blew @(d/submit! core (fn [_] (let [rec (fn rec [n] (inc (rec (inc n))))] (rec 0))))
+        ok   @(d/submit! core (fn [_] {:a 1}))]
+    (is (instance? StackOverflowError blew) "the runaway patch-fn is rejected via its promise")
+    (is (nil? (d/error core)) "a StackOverflowError does NOT halt the core")
+    (is (= {:a 1} ok) "the drainer kept draining the next tx")
+    (is (= [{:a 1}] @log) "only the good tx persisted")))
+
+(deftest vm-error-halts-via-backstop
+  ;; A VirtualMachineError other than StackOverflowError is process health, never
+  ;; a per-tx verdict: process! rethrows it and the drainer backstop turns it
+  ;; into a HALT — a dying JVM must not keep writing to disk (§5). Throwing a
+  ;; bare OutOfMemoryError *object* is safe; only the real JVM condition is not.
+  (let [{:keys [log append!]} (recording-append)
+        core (d/make-core {} append!)
+        p    (d/submit! core (fn [_] (throw (OutOfMemoryError. "simulated"))))]
+    (is (instance? OutOfMemoryError @p) "the VM error reaches the in-flight tx's promise")
+    (is (instance? OutOfMemoryError (d/error core)) "and HALTs the core, not a per-tx reject")
+    (is (= [] @log) "nothing was persisted")
+    (is (thrown? clojure.lang.ExceptionInfo (d/submit! core (fn [_] {:b 2})))
+        "the halted core refuses further writes")))
+
+(deftest quiesce-drains-and-retires
+  ;; close!'s drain step (dispatch/quiesce!): enqueue a final barrier, THEN read
+  ;; the drainer and join it — so all prior work is durable and the drainer is
+  ;; provably retired. Ordering guard: reading the drainer BEFORE the barrier
+  ;; could join a retired drainer from an earlier busy period while a fresh one
+  ;; is mid-flight (see quiesce!'s doc). We deliberately cross a busy-period
+  ;; boundary — period 1 drains and retires its drainer (so the drainer atom
+  ;; holds a now-dead thread), then period 2 fires fresh fire-and-forget work —
+  ;; so quiesce! must still flush all of it.
+  (let [{:keys [log append!]} (recording-append)
+        slow (fn [patch] (Thread/sleep 2) (append! patch))
+        core (d/make-core {} slow)]
+    (dotimes [i 5] (d/submit! core (fn [_] {(keyword (str "a" i)) i})))
+    (d/await core)                                     ; period 1 drains → drainer retires
+    (dotimes [i 5] (d/submit! core (fn [_] {(keyword (str "b" i)) i})))  ; period 2, no await
+    (d/quiesce! core)
+    (is (= 10 (count @log)) "quiesce joined the LIVE drainer: every prior write is durable")
+    (is (= 10 (count @core)))
+    (is (not (.isAlive ^Thread @(.-drainer ^dj.recorder.dispatch.Core core)))
+        "the drainer is provably retired after quiesce")
+    (testing "quiesce is halt-safe / re-entrant on a quiescent core (never throws)"
+      (is (nil? (d/quiesce! core)) "a second quiesce just returns nil"))))
+
 (deftest integrates-with-real-storage
   ;; The drainer's append! is the real file writer; after draining, an
   ;; independent read-log must reproduce the same state (one fold, §3/§6).

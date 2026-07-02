@@ -161,6 +161,21 @@
       (is (= {:a 1} @db) "deref still works after close (immutable view)")
       (is (thrown? Throwable (r/patch! db {:b 2})) "writes throw after close"))))
 
+(deftest close-is-clean-on-a-halted-db
+  ;; A db halted by an I/O failure must still close cleanly: close! drains via the
+  ;; halt-safe dispatch/quiesce! (which joins the drainer), NOT the throw-on-halt
+  ;; await (§5/§6). We force a halt by closing the underlying writer out-of-band,
+  ;; so the next append throws.
+  (with-path [path]
+    (let [db (r/open path)]
+      @(r/patch! db {:a 1})                                  ; one good, durable write
+      (.close ^java.lang.AutoCloseable (.-writer ^dj.recorder.Recorder db)) ; sabotage the writer
+      (is (instance? Throwable @(r/patch! db {:b 2}))
+          "the next write's append throws → the tx promise carries the I/O error")
+      (is (some? (r/halted db)) "the db is now halted")
+      (is (nil? (r/close! db)) "close! on a halted db returns nil, it does not throw")
+      (is (= {:a 1} @db) "the halted+closed db still derefs to its last good state"))))
+
 ;; ---------------------------------------------------------------------------
 ;; Torn-tail policy (§4)
 ;; ---------------------------------------------------------------------------

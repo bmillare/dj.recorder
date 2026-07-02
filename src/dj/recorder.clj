@@ -182,7 +182,11 @@
 
 (defn await
   "Block until every change enqueued before this call has been processed
-  (agent-style `await`; the read-your-writes barrier — §3). Returns nil."
+  (agent-style `await`; the read-your-writes barrier — §3). Returns nil — and a
+  returning `await` therefore *guarantees* every prior write is durable. Throws
+  the halted ex-info (agent parity with `clojure.core/await` on a failed agent)
+  if the db is already halted or halts before this call's work drains (§5); for a
+  halt-tolerant drain, close! handles it."
   [^Recorder db]
   (dispatch/await (.-core db))
   nil)
@@ -197,11 +201,17 @@
 (defn close!
   "Drain in-flight work, close the writer, and release the single-writer lock
   (§6). Idempotent: the first call wins (a one-shot flag), later calls no-op.
-  After close, `patch!`/`tx!` throw but `@db` still works (the db becomes an
-  immutable view of its last state — durable2's close-flag model). Returns nil."
+  Drains and retires the drainer through `dispatch/quiesce!` — which enqueues a
+  final barrier and *joins* the drainer thread (never interrupts; §7), so on
+  return the writer is safe to close and no drainer lingers. quiesce! is
+  halt-safe, so a db halted by an earlier I/O failure still closes cleanly (it
+  simply has nothing left to drain — unlike `await`, close! never throws on a
+  halted db). After close, `patch!`/`tx!` throw but `@db` still works (the db
+  becomes an immutable view of its last state — durable2's close-flag model).
+  Returns nil."
   [^Recorder db]
   (when (compare-and-set! (.-a-closed db) false true)
-    (dispatch/await (.-core db))                    ; let queued writes complete
+    (dispatch/quiesce! (.-core db))                 ; drain in-flight + retire the drainer (§6/§7)
     (.close ^java.lang.AutoCloseable (.-writer db))
     (.unlock ^Lock (.-lock db)))
   nil)

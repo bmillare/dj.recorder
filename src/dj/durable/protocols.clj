@@ -1,5 +1,10 @@
 (ns dj.durable.protocols
-  "Protocols defining the behavior of durable data stores and their storage backends.")
+  "Protocols defining the behavior of durable data stores and their storage backends.
+
+  ⚠ REFERENCE CODE — NOT part of the live library. Consumed only by the
+  `dj.durable2` prototype (see its ns docstring); the shipping `dj.recorder` path
+  does not require this. `DiffTransactor`/`diff-tx!` is the ancestor of the
+  current `dj.recorder/tx!`. Kept for design lineage only.")
 
 (defprotocol DiffTransactor
   "Protocol for transacting diffs against a data store."

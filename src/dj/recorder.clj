@@ -9,8 +9,10 @@
     (require '[dj.recorder :as r])
     (def db (r/open \"state.edn\"))      ; lock + rehydrate + ready the drainer
     @db                                  ; current realized state (instant; never blocks on I/O)
-    (r/record! db (fn [s] {:k v}))       ; enqueue a change; returns the per-tx promise
-    (r/record! db {:k v})                ; literal-patch convenience arity
+    (r/patch! db {:k v})                 ; enqueue a literal patch; returns the per-tx promise
+    (r/tx! db (fn [s] {:k v}))           ; enqueue a read-modify-write authoring fn
+    (r/update! db [:a :b] inc)           ; sugar: deep read-modify-write leaf
+    (r/move! db [:xs] 0 2)               ; sugar: reorder a vector element
     (r/await db)                         ; block until the queue drains (agent-style)
     (r/close! db)                        ; drain, close the file, release the lock
 
@@ -21,18 +23,21 @@
 
   Contracts surfaced here (runtime deep-dive):
     §1  unit of change = a `state -> patch` fn; only the returned *data* patch
-        is persisted. A literal patch is the `(constantly patch)` arity.
+        is persisted. `tx!` takes such a fn; `patch!` is the literal-patch
+        `(constantly patch)` arity. `update!`/`move!` are `tx!` sugar.
     §3  persist-then-publish: `@db` is the last *durably-written* state and may
-        lag the queue. Read-your-writes is opt-in: `@(record! …)` or `(await …)`.
+        lag the queue. Read-your-writes is opt-in: `@(patch! …)`/`@(tx! …)` or
+        `(await …)`.
     §4  torn tail on rehydrate is SURFACED by default (open raises with the
         offset + raw bytes); `:on-torn-tail :discard` truncates and proceeds.
     §5  a halted db (I/O failure) stays `deref`-able but rejects writes; recover
         via `close!` + re-`open`.
     §6  single-writer lock held for the db's life; `close!` drains before
-        releasing so in-flight `record!`s complete."
+        releasing so in-flight writes complete."
   (:refer-clojure :exclude [await])
   (:require [dj.recorder.storage :as storage]
-            [dj.recorder.dispatch :as dispatch])
+            [dj.recorder.dispatch :as dispatch]
+            [dj.recorder.patch :as patch])
   (:import [java.util.concurrent.locks Lock]))
 
 (set! *warn-on-reflection* true)
@@ -107,40 +112,69 @@
          (throw e))))))
 
 ;; ---------------------------------------------------------------------------
-;; record! — enqueue a change
+;; patch! / tx! — enqueue a change
+;;
+;; The unit of change is a `state -> patch` fn (§1); only the returned *data*
+;; patch is ever persisted (a closure is never stored — patch-sketch §7.5). The
+;; two entry points differ only in what the caller supplies:
+;;   • `patch!` — a literal patch value (data), enqueued as `(constantly patch)`.
+;;   • `tx!`    — a `state -> patch` authoring fn, for read-modify-write.
+;; Splitting them (vs. one `fn?`-dispatching entry) means data that happens to be
+;; callable — records/maps implementing IFn — is never mistaken for an authoring
+;; fn, and each name reads for exactly one job.
 ;; ---------------------------------------------------------------------------
 
-(defn record!
-  "Enqueue a change and return its per-tx promise (§1/§5).
+(defn- enqueue!
+  "Guard the closed flag, then hand a `state -> patch` fn to the drainer (§1).
+  Returns the per-tx promise: it resolves to the new realized state on success,
+  or to a `Throwable` on a patch/authoring or I/O error (the error channel §5).
+  Throws if the db is closed, or if it is halted by an earlier I/O failure."
+  [^Recorder db f]
+  (when @(.-a-closed db)
+    (throw (ex-info "dj.recorder: db is closed" {:dj.recorder/closed true :path (str (.-path db))})))
+  (dispatch/submit! (.-core db) f))
 
-  `patch-or-fn` is either a `state -> patch` authoring fn (run serialized on the
-  drainer against the latest realized state, so read-modify-write is race-free —
-  §9) or a literal patch value (anything not a fn), wrapped as `(constantly …)`.
-  Only the returned *data* patch is ever persisted; the fn may close over and
-  read state, but a closure is never stored (patch-sketch §7.5).
+(defn patch!
+  "Enqueue a literal `patch` (plain data) and return its per-tx promise (§1/§5).
+
+  The patch is applied against the latest realized state on the drainer and the
+  *data* itself is persisted verbatim. Use `tx!` when the patch must be computed
+  from current state (read-modify-write).
 
   The returned promise is both the sync barrier and the error channel: it
   resolves to the new realized state on success, or to a `Throwable` on a
-  patch/authoring or I/O error. Fire-and-forget = ignore it; sync = deref it
-  (and branch on `Throwable`), or use `record!-sync`. Because of
-  persist-then-publish, `@db` may lag a fire-and-forget write — to read your own
-  write, deref the promise or `await` first (§3).
+  patch/I/O error. Fire-and-forget = ignore it; sync = deref it (and branch on
+  `Throwable`). Because of persist-then-publish, `@db` may lag a fire-and-forget
+  write — to read your own write, deref the promise or `await` first (§3)."
+  [^Recorder db patch]
+  (enqueue! db (constantly patch)))
 
-  Throws if the db is closed, or if it is halted by an earlier I/O failure
-  (writes throw on a halted db; reads still work — §5)."
-  [^Recorder db patch-or-fn]
-  (when @(.-a-closed db)
-    (throw (ex-info "dj.recorder: db is closed" {:dj.recorder/closed true :path (str (.-path db))})))
-  (dispatch/submit! (.-core db)
-                    (if (fn? patch-or-fn) patch-or-fn (constantly patch-or-fn))))
+(defn tx!
+  "Enqueue a `state -> patch` authoring fn `f` and return its per-tx promise
+  (§1/§5). `f` is run serialized on the drainer against the latest realized
+  state, so read-modify-write is race-free (§9); only the *data* patch it
+  returns is persisted (a returned `nil` is a no-op). See `patch/update-in` and
+  `patch/move` for building the returned patch; `update!`/`move!` wrap the common
+  cases. Same promise/error-channel semantics as `patch!`."
+  [^Recorder db f]
+  (enqueue! db f))
 
-(defn record!-sync
-  "Like `record!` but block on the result and rethrow on failure: returns the
-  new realized state, or throws the tx's `Throwable`. Sugar for
-  `@(record! …)` + the `instance? Throwable` branch (§5)."
-  [db patch-or-fn]
-  (let [v @(record! db patch-or-fn)]
-    (if (instance? Throwable v) (throw v) v)))
+(defn update!
+  "Read-modify-write a deep leaf: sugar for
+  `(tx! db (fn [s] (apply patch/update-in s path f args)))`. Reads `(get-in s
+  path)`, applies `f`, and persists the overwritten leaf (so a shrinking `f`
+  like `dissoc` is reflected). `path` may be empty to update the root. Returns
+  the per-tx promise."
+  [db path f & args]
+  (tx! db (fn [s] (apply patch/update-in s path f args))))
+
+(defn move!
+  "Relocate the element of the vector at `path` from index `from` to index `to`:
+  sugar for `(tx! db (fn [s] (patch/move s path from to)))`. `to` is the
+  element's final 0-based index; `from` = `to` is a no-op. `path` may be empty
+  when the root is the vector. Returns the per-tx promise."
+  [db path from to]
+  (tx! db (fn [s] (patch/move s path from to))))
 
 ;; ---------------------------------------------------------------------------
 ;; await / halted / close!
@@ -163,11 +197,11 @@
 (defn close!
   "Drain in-flight work, close the writer, and release the single-writer lock
   (§6). Idempotent: the first call wins (a one-shot flag), later calls no-op.
-  After close, `record!` throws but `@db` still works (the db becomes an
+  After close, `patch!`/`tx!` throw but `@db` still works (the db becomes an
   immutable view of its last state — durable2's close-flag model). Returns nil."
   [^Recorder db]
   (when (compare-and-set! (.-a-closed db) false true)
-    (dispatch/await-drained (.-core db))            ; let queued record!s complete
+    (dispatch/await-drained (.-core db))            ; let queued writes complete
     (.close ^java.lang.AutoCloseable (.-writer db))
     (.unlock ^Lock (.-lock db)))
   nil)

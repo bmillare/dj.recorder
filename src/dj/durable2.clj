@@ -1,5 +1,14 @@
 (ns dj.durable2
-  "A durable, append-only key-value storage system supporting EDN and transactions."
+  "A durable, append-only key-value storage system supporting EDN and transactions.
+
+  ⚠ REFERENCE CODE — NOT part of the live library. The shipping API is
+  `dj.recorder` (→ `dj.recorder.storage` + `dj.recorder.dispatch` +
+  `dj.recorder.patch`); nothing in that path requires this namespace or
+  `dj.durable.protocols`. This is the earlier prototype kept in-tree as a design
+  reference: the single-writer file lock (`storage.clj`) and the close-flag model
+  were ported from here, and its `diff-tx!` protocol is the ancestor of today's
+  `tx!`. Read it for lineage; don't wire it in. Do not extend it — evolve
+  `dj.recorder` instead."
   (:require [dj.durable.protocols :as p]
             [clojure.java.io :as io]
             [clojure.edn :as edn]))

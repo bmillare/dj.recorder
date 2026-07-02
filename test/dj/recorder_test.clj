@@ -1,9 +1,9 @@
 (ns dj.recorder-test
-  "Exercises the public API / lifecycle (alpha item 4): open/record!/@db/await/
-  close!, the literal-patch arity, record!-sync, read-your-writes, durable
-  round-trip across a close+re-open, the torn-tail :surface/:discard policy, the
-  single-writer lock, and the closed-rejects-writes contract. Runtime deep-dive
-  §1/§3/§4/§5/§6."
+  "Exercises the public API / lifecycle (alpha item 4): open/patch!/tx!/@db/
+  await/close!, the update!/move! sugar, deref-based read-your-writes (the error
+  channel surfaces a rejected tx as a Throwable), durable round-trip across a
+  close+re-open, the torn-tail :surface/:discard policy, the single-writer lock,
+  and the closed-rejects-writes contract. Runtime deep-dive §1/§3/§4/§5/§6."
   (:refer-clojure :exclude [await])
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.java.io :as io]
@@ -38,7 +38,7 @@
                            [StandardOpenOption/CREATE StandardOpenOption/APPEND])))
 
 ;; ---------------------------------------------------------------------------
-;; open / record! / @db
+;; open / patch! / tx! / @db
 ;; ---------------------------------------------------------------------------
 
 (deftest fresh-open-and-record
@@ -46,11 +46,11 @@
     (let [db (r/open path)]
       (try
         (is (= {} @db) "a fresh db derefs to the default baseline")
-        (let [p (r/record! db (fn [_] {:user {:name "Bob"}}))]
+        (let [p (r/tx! db (fn [_] {:user {:name "Bob"}}))]
           (is (= {:user {:name "Bob"}} @p) "the promise resolves to the new realized state")
           (is (= {:user {:name "Bob"}} @db) "after the promise resolves, @db reflects the write"))
         ;; authoring fn reads prior state -> race-free read-modify-write
-        (r/record!-sync db (fn [s] {:user {:age (if (:user s) 31 0)}}))
+        @(r/tx! db (fn [s] {:user {:age (if (:user s) 31 0)}}))
         (is (= {:user {:name "Bob" :age 31}} @db))
         (finally (r/close! db))))))
 
@@ -59,27 +59,38 @@
     (let [db (r/open path {:baseline []})]
       (try
         (is (= [] @db) "root state can be a non-map baseline")
-        (is (= [1 2 3] (r/record!-sync db [1 2 3])) "vector-patch appends")
+        (is (= [1 2 3] @(r/patch! db [1 2 3])) "vector-patch appends")
         (finally (r/close! db))))))
 
-(deftest literal-patch-arity
+(deftest literal-patch-via-patch!
   (with-path [path]
     (let [db (r/open path)]
       (try
-        (is (= {:k 1} (r/record!-sync db {:k 1})) "a non-fn arg is treated as a literal patch")
-        (is (= {:k 1 :j 2} (r/record!-sync db {:j 2})))
+        (is (= {:k 1} @(r/patch! db {:k 1})) "patch! enqueues a literal data patch")
+        (is (= {:k 1 :j 2} @(r/patch! db {:j 2})))
         (finally (r/close! db))))))
 
-(deftest record-sync-rethrows-on-bad-patch
+(deftest update!-and-move!-sugar
+  (with-path [path]
+    (let [db (r/open path {:baseline {:tracks {"strobe" {:plays 0}} :crate [:a :b :c]}})]
+      (try
+        (is (= {:tracks {"strobe" {:plays 1}} :crate [:a :b :c]}
+               @(r/update! db [:tracks "strobe" :plays] inc))
+            "update! is a deep read-modify-write leaf")
+        (is (= [:b :c :a] (:crate @(r/move! db [:crate] 0 2)))
+            "move! reorders a vector element")
+        (finally (r/close! db))))))
+
+(deftest rejected-tx-surfaces-throwable-via-deref
   (with-path [path]
     (let [db (r/open path {:baseline {:items 5}})]            ; :items is a scalar
       (try
         ;; #dj.recorder/splice requires a vector -> apply-patch throws -> rejected tx
-        (is (thrown? Throwable
-                     (r/record!-sync db {:items (p/read-splice [{:at 0 :+ [9]}])}))
-            "record!-sync rethrows the rejected tx's Throwable")
+        (is (instance? Throwable
+                       @(r/patch! db {:items (p/read-splice [{:at 0 :+ [9]}])}))
+            "a rejected tx resolves its promise to a Throwable (the error channel)")
         (is (nil? (r/halted db)) "a patch error does NOT halt the db")
-        (is (= {:items 5 :ok true} (r/record!-sync db {:ok true}))
+        (is (= {:items 5 :ok true} @(r/patch! db {:ok true}))
             "and the db keeps working after a rejected tx")
         (finally (r/close! db))))))
 
@@ -90,12 +101,12 @@
   (with-path [path]
     (let [db (r/open path)]
       (try
-        (r/record!-sync db {:keep 1})              ; seed real, persisted state
-        (is (= {:keep 1} (r/record!-sync db (fn [_] nil)))
+        @(r/patch! db {:keep 1})                   ; seed real, persisted state
+        (is (= {:keep 1} @(r/tx! db (fn [_] nil)))
             "nil return leaves the realized state untouched")
         (is (= {:keep 1} @db) "the db is preserved, not nilled")
         (is (nil? (r/halted db)) "a nil patch does not halt the db")
-        (r/record!-sync db {:added true})          ; still writable afterwards
+        @(r/patch! db {:added true})               ; still writable afterwards
         (finally (r/close! db)))
       ;; and the nil no-op persisted nothing: a fresh re-open replays no nil
       ;; line, so it rehydrates to exactly the writes that mattered.
@@ -108,8 +119,8 @@
   (with-path [path]
     (let [db (r/open path)]
       (try
-        (dotimes [i 50] (r/record! db {(keyword (str "k" i)) i}))  ; fire-and-forget
-        (r/await db)                                               ; barrier
+        (dotimes [i 50] (r/patch! db {(keyword (str "k" i)) i}))  ; fire-and-forget
+        (r/await db)                                              ; barrier
         (is (= 50 (count @db)) "await drains all prior fire-and-forget writes")
         (finally (r/close! db))))))
 
@@ -120,9 +131,9 @@
 (deftest survives-close-and-reopen
   (with-path [path]
     (let [db (r/open path)]
-      (r/record!-sync db {:user {:name "Bob"}})
-      (r/record!-sync db (fn [_] {:user {:age 31}}))
-      (r/record!-sync db {:items [1 2 3]})
+      @(r/patch! db {:user {:name "Bob"}})
+      @(r/tx! db (fn [_] {:user {:age 31}}))
+      @(r/patch! db {:items [1 2 3]})
       (r/close! db))
     ;; a brand-new handle replays the on-disk log onto baseline -> same state
     (let [db2 (r/open path)]
@@ -134,7 +145,7 @@
 (deftest close-drains-queued-work
   (with-path [path]
     (let [db (r/open path)]
-      (dotimes [i 100] (r/record! db {(keyword (str "k" i)) i}))  ; don't await
+      (dotimes [i 100] (r/patch! db {(keyword (str "k" i)) i}))  ; don't await
       (r/close! db))                                              ; close must drain first
     (let [db2 (r/open path)]
       (try
@@ -144,11 +155,11 @@
 (deftest close-is-idempotent-and-rejects-writes
   (with-path [path]
     (let [db (r/open path)]
-      (r/record!-sync db {:a 1})
+      @(r/patch! db {:a 1})
       (r/close! db)
       (r/close! db)                                       ; second close no-ops
       (is (= {:a 1} @db) "deref still works after close (immutable view)")
-      (is (thrown? Throwable (r/record! db {:b 2})) "writes throw after close"))))
+      (is (thrown? Throwable (r/patch! db {:b 2})) "writes throw after close"))))
 
 ;; ---------------------------------------------------------------------------
 ;; Torn-tail policy (§4)
@@ -158,7 +169,7 @@
   (with-path [path]
     ;; one good record, then a partial trailing record (no terminating \n)
     (let [db (r/open path)]
-      (r/record!-sync db {:good 1})
+      @(r/patch! db {:good 1})
       (r/close! db))
     (append-raw! path "{:torn ")                          ; fabricate a crash tail
     (let [ex (try (r/open path) nil (catch clojure.lang.ExceptionInfo e e))]
@@ -175,13 +186,13 @@
 (deftest torn-tail-discard-then-writable
   (with-path [path]
     (let [db (r/open path)]
-      (r/record!-sync db {:good 1})
+      @(r/patch! db {:good 1})
       (r/close! db))
     (append-raw! path "{:torn ")
     (let [db (r/open path {:on-torn-tail :discard})]
       (try
         (is (= {:good 1} @db))
-        (is (= {:good 1 :more 2} (r/record!-sync db {:more 2})) "can record after a discard")
+        (is (= {:good 1 :more 2} @(r/patch! db {:more 2})) "can record after a discard")
         (finally (r/close! db)))
       ;; and the discard+new write round-trips cleanly on the next open
       (let [db2 (r/open path)]

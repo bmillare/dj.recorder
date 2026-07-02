@@ -167,11 +167,12 @@
 ;;
 ;; Both are *patch constructors*: they read the current state and return a
 ;; plain-data patch (run-now, persist-the-result — no fn in the log). Use them
-;; INSIDE the `(fn [s] …)` authoring arity of `record!`, where `s` is the
-;; atomic dispatch-thread state, so the read-modify-write stays race-free:
+;; INSIDE the `(fn [s] …)` authoring fn passed to `tx!`, where `s` is the
+;; atomic dispatch-thread state, so the read-modify-write stays race-free (the
+;; `update!`/`move!` sugar on `dj.recorder` wraps exactly these two calls):
 ;;
-;;   (record! db (fn [s] (patch/update-in s [:tracks "strobe" :plays] inc)))
-;;   (record! db (fn [s] (patch/move s [:crates "main"] 0 2)))
+;;   (tx! db (fn [s] (patch/update-in s [:tracks "strobe" :plays] inc)))
+;;   (tx! db (fn [s] (patch/move s [:crates "main"] 0 2)))
 ;; ---------------------------------------------------------------------------
 
 (defn- leaf-patch
@@ -200,7 +201,7 @@
   remove). The common scalar RMW (e.g. `inc` a counter) yields a clean nested
   literal; collection/nil results are wrapped in `#dj.recorder/replace`.
 
-  Meant for use inside a `record!` authoring fn so `s` is the dispatch-thread
+  Meant for use inside a `tx!` authoring fn so `s` is the dispatch-thread
   state (race-free). `path` may be empty to update the root."
   [s path f & args]
   (nest path (leaf-patch (apply f (get-in s path) args))))

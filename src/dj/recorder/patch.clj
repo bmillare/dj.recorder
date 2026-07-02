@@ -22,40 +22,9 @@
   sets and bulk). `#dj.recorder/splice` does ordered positional vector
   edits (insert / delete / range-replace).
 
-  Design decisions are marked [Dn] at their code sites; each rule below, with
-  the fuller mechanism at the site and the rationale in the sketch + watson
-  RI 31:
-
-  [D1] Inline vector indices are ORIGINAL-relative: within one patch map, edits
-       apply first (never shifting the vector), then tombstones highest-index
-       first — so a patch always addresses the vector you started with,
-       independent of map iteration order. (apply-map)
-  [D2] Splice hunks must be non-overlapping and have distinct `:at`; all hunks
-       are validated fail-loud before any edit is applied. (validate-hunks!)
-  [D3] Dissoc of a record's *basis* key throws (it would silently degrade the
-       record to a plain map); extension keys dissoc fine. (dissoc-guarded)
-  [D4] Patches must be plain, replayable EDN — `assert-edn!` enforces it and
-       the storage append path calls it before writing. Whitelist:
-       nil/booleans/numbers/strings/chars/keywords/symbols, java.util.Date
-       (#inst) and java.util.UUID (#uuid), the three marker records, and
-       collections thereof. All other records/objects are rejected, INCLUDING
-       record patches (a record value in *state* is fine to merge into; a
-       record used *as a patch* would hit the log as an unreadable tag).
-       CAVEAT: the #inst textual round-trip only holds for 4-digit years
-       (0001–9999); an extreme java.util.Date is not narrowed here but is
-       refused at append by storage's serialize-and-reparse backstop (the tx
-       fails loudly, nothing reaches the log).
-  [D5] Seq/list patches append into a realized PersistentList — no lazy `concat`
-       stack bomb, no laziness in durable state; O(n) per append, so prefer
-       vectors for anything that grows. (apply-patch)
-  [D6] `:dj.recorder/dissoc` is reserved only as a *map-value* (as a
-       set/vector/list element, a map key, or a leaf under #dj.recorder/replace
-       it is ordinary data); store it verbatim at a key via
-       `#dj.recorder/replace` — `update-in`'s leaf-patch does this. (leaf-patch)
-  [D7] A map patch onto nil always builds a map, even with integer keys
-       (assoc-in parity) — a path through a missing vector does not conjure a
-       vector; seed it first (or #dj.recorder/replace it). Editing a vector at
-       index = count appends (assoc parity). (apply-map / update-in)
+  Locked decisions [D1]–[D7] (marked [Dn] at their code sites) live in the
+  register agent/live/decisions.md — the rule and rationale for each. The site
+  comments below carry the mechanism where the code needs it.
 
   Authoring helpers (below) build patches for the two cases hand-nesting is
   tedious: `update-in` (read-modify-write a deep leaf) and `move` (relocate a

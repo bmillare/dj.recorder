@@ -2,10 +2,17 @@
   "Alpha item 5 — exercise/dogfood. A small but real app on the public API:
   a DJ crate/library manager. Tracks live in a map keyed by id; crates are
   ORDERED vectors of ids (the splice stress case). We drive the whole public
-  surface (open/record!/record!-sync/@db/await/close!) through additive merge,
-  set union, vector append, splice, inline + op-form dissoc, #replace, and a
-  read-modify-write authoring fn, then exercise durability (close/reopen) and
-  torn-tail recovery (surface + discard).
+  surface (open/patch!/tx!/update!/move!/await/@db/close!) through additive
+  merge, set union, vector append, splice, inline + op-form dissoc, #replace,
+  and a read-modify-write authoring fn, then exercise durability (close/reopen)
+  and torn-tail recovery (surface + discard).
+
+  The write API is promise-based (RI 26/27): patch!/tx!/update!/move! each
+  return a per-tx promise that resolves to the new realized state on success or
+  to a Throwable on failure (the error channel, §5). The old synchronous
+  `record!-sync` was dropped; the caller composes 'block, then throw on failure'
+  from that promise. The `sync!` helper below is exactly that composition, and
+  every write here wraps its promise in it.
 
   Run (from the dj.recorder repo root, inside the nix shell):
     clojure -Sdeps '{:paths [\"src\" \"resources\" \"dev\"]}' -M -m dj.recorder.dogfood
@@ -14,17 +21,28 @@
   summarized in agent/ledger/2026-06-27-alpha-dogfood-friction.md."
   (:require [dj.recorder :as r]
             [dj.recorder.patch :as patch]
-            [dj.recorder.storage :as storage]
+            [clojure.string :as str]
             [clojure.java.io :as io]))
 
 ;; A tagged-literal splice reads here because resources/data_readers.clj is on
 ;; the classpath — so `#dj.recorder/splice [...]` works in source verbatim.
 
+(defn- sync!
+  "Block on a per-tx promise and return its resolved state — or, if the drainer
+  surfaced an error through the promise (the error channel, §5), rethrow it.
+  This is the synchronous 'do it and throw on failure' ergonomic the old
+  `record!-sync` bundled in; RI 26 dropped that, so the caller composes it from
+  the promise. Every write below wraps its patch!/tx!/update!/move! promise
+  in this."
+  [p]
+  (let [v @p]
+    (if (instance? Throwable v) (throw v) v)))
+
 (defn- line [s] (println (str "\n=== " s " ===")))
 (defn- show [db] (println "  @db =>" (pr-str @db)))
 (defn- dump-log [path]
   (println "  --- on-disk log ---")
-  (doseq [l (clojure.string/split-lines (slurp path))]
+  (doseq [l (str/split-lines (slurp path))]
     (println "  " l))
   (println "  -------------------"))
 
@@ -48,63 +66,68 @@
       ;; FRICTION(low): adding a track is a clean literal patch, but every
       ;; write restates the full nesting path {:tracks {<id> {...}}}. Fine
       ;; shallow; gets verbose deep (see step 8, the RI-8 builder question).
-      (r/record!-sync db {:tracks {"strobe" {:title "Strobe" :artist "deadmau5"
-                                             :bpm 128 :plays 0
-                                             :tags #{:progressive :melodic}}}})
-      (r/record!-sync db {:tracks {"opus"   {:title "Opus" :artist "Eric Prydz"
-                                             :bpm 126 :plays 0
-                                             :tags #{:progressive}}}})
+      (sync! (r/patch! db {:tracks {"strobe" {:title "Strobe" :artist "deadmau5"
+                                              :bpm 128 :plays 0
+                                              :tags #{:progressive :melodic}}}}))
+      (sync! (r/patch! db {:tracks {"opus"   {:title "Opus" :artist "Eric Prydz"
+                                              :bpm 126 :plays 0
+                                              :tags #{:progressive}}}}))
       (show db)
 
       (line "3. additive set union — grow a track's tag set")
       ;; Set patch unions in: no read needed, no clobber. This is the algebra
       ;; at its best — the additive default is exactly what you want.
-      (r/record!-sync db {:tracks {"opus" {:tags #{:classic :uplifting}}}})
+      (sync! (r/patch! db {:tracks {"opus" {:tags #{:classic :uplifting}}}}))
       (println "  opus tags =>" (pr-str (get-in @db [:tracks "opus" :tags])))
       (assert (= #{:progressive :classic :uplifting}
                  (get-in @db [:tracks "opus" :tags])))
 
       (line "4. additive vector append — build an ordered crate")
       ;; A crate is an ordered [id ...]; vector patches CONCAT (append).
-      (r/record!-sync db {:crates {"mainroom" ["strobe" "opus"]}})
+      (sync! (r/patch! db {:crates {"mainroom" ["strobe" "opus"]}}))
       (show db)
       (assert (= ["strobe" "opus"] (get-in @db [:crates "mainroom"])))
 
       (line "5. add a third track, then SPLICE it into the middle of the crate")
-      (r/record!-sync db {:tracks {"every" {:title "Every Day" :artist "Eric Prydz"
-                                            :bpm 126 :plays 0 :tags #{:vocal}}}})
+      (sync! (r/patch! db {:tracks {"every" {:title "Every Day" :artist "Eric Prydz"
+                                             :bpm 126 :plays 0 :tags #{:vocal}}}}))
       ;; Insert "every" at index 1 (between strobe and opus): {:at 1 :- 0 :+ [..]}.
       ;; FRICTION(med): the hunk keys `:-`/`:+` are terse-to-cryptic, and the
       ;; splice lives INSIDE the crate map so you must hold "this op targets the
       ;; vector at this path" in your head. Once internalized it reads OK.
-      (r/record!-sync db {:crates {"mainroom" #dj.recorder/splice [{:at 1 :- 0 :+ ["every"]}]}})
+      (sync! (r/patch! db {:crates {"mainroom" #dj.recorder/splice [{:at 1 :- 0 :+ ["every"]}]}}))
       (println "  crate =>" (pr-str (get-in @db [:crates "mainroom"])))
       (assert (= ["strobe" "every" "opus"] (get-in @db [:crates "mainroom"])))
 
-      (line "6. patch/move — relocate strobe (idx 0) to the end")
+      (line "6. r/move! — relocate strobe (idx 0) to the end")
       ;; RESOLVED(was FRICTION-high): a "move" used to be two coordinated,
       ;; original-relative, non-overlapping splice hunks with the value named by
-      ;; hand. `patch/move` builds that splice from final-position indices: send
-      ;; it inside the authoring fn so `s` is the dispatch-thread vector.
-      (r/record!-sync db (fn [s] (patch/move s [:crates "mainroom"] 0 2)))
+      ;; hand. `r/move!` is the public sugar — it wraps
+      ;; `(tx! db (fn [s] (patch/move s path from to)))`, building that splice
+      ;; from final-position indices.
+      (sync! (r/move! db [:crates "mainroom"] 0 2))
       (println "  crate =>" (pr-str (get-in @db [:crates "mainroom"])))
       (assert (= ["every" "opus" "strobe"] (get-in @db [:crates "mainroom"])))
 
       (line "7. #replace vs additive — reset a tag set wholesale")
       ;; Additive would UNION; to overwrite you need the #replace escape.
-      (r/record!-sync db {:tracks {"opus" {:tags #dj.recorder/replace #{:peaktime}}}})
+      (sync! (r/patch! db {:tracks {"opus" {:tags #dj.recorder/replace #{:peaktime}}}}))
       (println "  opus tags =>" (pr-str (get-in @db [:tracks "opus" :tags])))
       (assert (= #{:peaktime} (get-in @db [:tracks "opus" :tags])))
 
-      (line "8. patch/update-in — read-modify-write a play counter")
+      (line "8. r/update! + patch/update-in — read-modify-write a play counter")
       ;; RESOLVED(was FRICTION-med, RI-8): the READ was easy (get-in s ...) but
       ;; you then hand-rebuilt the full nesting path. `patch/update-in` is
       ;; clojure.core/update-in that returns the nested patch instead of a new
       ;; map — no re-nesting, mirrors the core arg order, and overwrites the
       ;; leaf faithfully (a shrinking f is reflected; collection/nil → #replace).
-      (r/record!-sync db (fn [s] (patch/update-in s [:tracks "strobe" :plays] (fnil inc 0))))
-      (println "  strobe plays =>" (get-in @db [:tracks "strobe" :plays]))
+      ;; `r/update!` is the sugar: (tx! db (fn [s] (apply patch/update-in s path
+      ;; f args))). We dogfood BOTH — the sugar, then the raw tx!+helper compose.
+      (sync! (r/update! db [:tracks "strobe" :plays] (fnil inc 0)))   ; via the sugar
       (assert (= 1 (get-in @db [:tracks "strobe" :plays])))
+      (sync! (r/tx! db (fn [s] (patch/update-in s [:tracks "strobe" :plays] inc)))) ; raw compose
+      (println "  strobe plays =>" (get-in @db [:tracks "strobe" :plays]))
+      (assert (= 2 (get-in @db [:tracks "strobe" :plays])))
 
       (line "9. nil is the identity patch — returning nil is a safe no-op")
       ;; Option 1 (design pt D): a state->patch fn that returns nil — the
@@ -113,39 +136,40 @@
       ;; footgun is gone.) The three intents are now distinct and explicit:
       ;; no-change = nil; remove = dissoc; store a literal nil = #replace nil.
       (let [tmp (fresh-path) tdb (r/open tmp)]
-        (r/record!-sync tdb {:keep 1})
-        (r/record!-sync tdb (fn [_] nil))           ; the reflex "no change"
+        (sync! (r/patch! tdb {:keep 1}))
+        (sync! (r/tx! tdb (fn [_] nil)))            ; the reflex "no change"
         (println "  after (fn [_] nil), @db =>" (pr-str @tdb) "  <-- preserved, not nilled")
         (assert (= {:keep 1} @tdb))
         ;; To intentionally STORE nil at a key, ask for it explicitly:
-        (r/record!-sync tdb {:note #dj.recorder/replace nil})
+        (sync! (r/patch! tdb {:note #dj.recorder/replace nil}))
         (println "  after #replace nil at :note, @db =>" (pr-str @tdb))
         (assert (= {:keep 1 :note nil} @tdb))
         (assert (contains? @tdb :note) ":note is present with a literal nil value")
         (r/close! tdb))
 
       (line "10. fail-loud — bad patch is rejected; the db survives, no halt")
-      ;; Merge a map into a scalar (:bpm is 128) — apply-map refuses. record!-sync
-      ;; rethrows; state is untouched and the db keeps working.
+      ;; Merge a map into a scalar (:bpm is 128) — apply-map refuses. The tx's
+      ;; promise carries the error (the error channel §5), and `sync!` rethrows
+      ;; it; state is untouched and the db keeps working (not halted).
       (let [before @db]
         (try
-          (r/record!-sync db {:tracks {"strobe" {:bpm {:oops "map-into-scalar"}}}})
+          (sync! (r/patch! db {:tracks {"strobe" {:bpm {:oops "map-into-scalar"}}}}))
           (assert false "expected a throw")
           (catch clojure.lang.ExceptionInfo e
             (println "  rejected:" (.getMessage e))))
         (assert (= before @db) "state must be untouched after a rejected tx")
-        (assert (nil? (r/halted db)) "a patch error must NOT halt the db")
+        (assert (nil? (r/error db)) "a patch error must NOT halt the db")
         ;; still writable afterwards
-        (r/record!-sync db {:tracks {"strobe" {:plays 2}}})
+        (sync! (r/patch! db {:tracks {"strobe" {:plays 2}}}))
         (assert (= 2 (get-in @db [:tracks "strobe" :plays]))))
 
       (line "11. inline dissoc tombstone — remove a track key")
-      (r/record!-sync db {:tracks {"every" :dj.recorder/dissoc}})
+      (sync! (r/patch! db {:tracks {"every" :dj.recorder/dissoc}}))
       (println "  track ids =>" (pr-str (keys (:tracks @db))))
       (assert (nil? (get-in @db [:tracks "every"])))
 
       (line "12. #dissoc op form — bulk-remove tags from a set")
-      (r/record!-sync db {:tracks {"strobe" {:tags #dj.recorder/dissoc [:melodic]}}})
+      (sync! (r/patch! db {:tracks {"strobe" {:tags #dj.recorder/dissoc [:melodic]}}}))
       (println "  strobe tags =>" (pr-str (get-in @db [:tracks "strobe" :tags])))
       (assert (= #{:progressive} (get-in @db [:tracks "strobe" :tags])))
 
@@ -187,7 +211,7 @@
         (println "  reopened; \"ghost\" present?" (contains? (:tracks @db3) "ghost"))
         (assert (not (contains? (:tracks @db3) "ghost")))
         ;; and it's writable again after the discard
-        (r/record!-sync db3 {:tracks {"closer" {:title "Closer" :bpm 124}}})
+        (sync! (r/patch! db3 {:tracks {"closer" {:title "Closer" :bpm 124}}}))
         (assert (= "Closer" (get-in @db3 [:tracks "closer" :title])))
         (r/close! db3))
 

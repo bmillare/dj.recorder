@@ -1,8 +1,9 @@
 (ns dj.recorder.dispatch-test
   "Exercises the dispatch core (alpha item 3): on-demand vthread drainer,
   persist-then-publish ordering, the per-tx promise as result + error channel,
-  no-op skip, patch-error reject-and-continue, I/O-error HALT, and FIFO
-  submission order under concurrency. Runtime deep-dive §2/§3/§5/§9."
+  no-op skip, patch-error reject-and-continue, I/O-error HALT, quiesce!'s
+  seal+drain+join, the two refusal markers (halted vs sealed/closed), and FIFO
+  submission order under concurrency. Runtime deep-dive §2/§3/§5/§6/§9."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.java.io :as io]
             [dj.recorder.patch :as p]
@@ -25,7 +26,7 @@
 
 (deftest basic-submit-applies-and-persists
   (let [{:keys [log append!]} (recording-append)
-        core (d/make-core {} append!)]
+        core (d/make-core (atom {}) append!)]
     (let [r1 @(d/submit! core (fn [_] {:user {:name "Bob"}}))
           r2 @(d/submit! core (fn [s] {:user {:age (if (:user s) 31 0)}}))]
       (is (= {:user {:name "Bob"}} r1) "promise resolves to the new realized state")
@@ -36,7 +37,7 @@
 
 (deftest no-op-skips-the-log
   (let [{:keys [log append!]} (recording-append)
-        core (d/make-core {:a 1} append!)]
+        core (d/make-core (atom {:a 1}) append!)]
     (let [r @(d/submit! core (fn [_] {}))]              ; {} merges to no change
       (is (= {:a 1} r) "no-op promise resolves to the unchanged state")
       (is (= [] @log) "a no-op persists nothing"))
@@ -47,7 +48,7 @@
 
 (deftest patch-error-rejects-one-tx-and-continues
   (let [{:keys [log append!]} (recording-append)
-        core (d/make-core {:items [1 2 3]} append!)]
+        core (d/make-core (atom {:items [1 2 3]}) append!)]
     ;; #dj.recorder/splice onto a non-vector throws inside apply-patch
     (let [bad @(d/submit! core (fn [_] {:items (p/read-replace 5)}))
           err @(d/submit! core (fn [_] {:items (p/read-splice [{:at 0 :+ [9]}])}))
@@ -60,7 +61,7 @@
           "only the successful txs persisted; the rejected one did not"))))
 
 (deftest io-error-halts
-  (let [core (d/make-core {} (throwing-append 2))]      ; 2nd append throws
+  (let [core (d/make-core (atom {}) (throwing-append 2))]  ; 2nd append throws
     (let [r1 @(d/submit! core (fn [_] {:a 1}))]
       (is (= {:a 1} r1)))
     (let [r2 @(d/submit! core (fn [_] {:b 2}))]
@@ -87,7 +88,7 @@
                   (if (= :fail @gate)
                     (throw (java.io.IOException. "boom"))
                     (swap! log conj patch)))
-        core  (d/make-core {} append!)
+        core  (d/make-core (atom {}) append!)
         p1    (d/submit! core (fn [_] {:a 1}))]        ; will block in append!
     @start                                              ; drainer is now inside append!
     (let [p2 (d/submit! core (fn [_] {:b 2}))          ; queued behind p1
@@ -101,7 +102,7 @@
 (deftest await-blocks-until-empty
   (let [{:keys [log append!]} (recording-append)
         slow-append (fn [patch] (Thread/sleep 2) (append! patch))
-        core (d/make-core {} slow-append)]
+        core (d/make-core (atom {}) slow-append)]
     (dotimes [i 20] (d/submit! core (fn [_] {(keyword (str "k" i)) i})))
     (d/await core)
     (is (= 20 (count @log)) "await returns only after all queued txs drained")
@@ -113,7 +114,7 @@
   ;; vector via the additive algebra; the result must be a permutation whose
   ;; per-thread subsequence is monotonic. Simpler check: count + completeness.
   (let [{:keys [log append!]} (recording-append)
-        core (d/make-core {:seq []} append!)
+        core (d/make-core (atom {:seq []}) append!)
         n    200
         ths  (mapv (fn [i]
                      (Thread/startVirtualThread
@@ -132,7 +133,7 @@
   ;; agent parity with clojure.core/await on a failed agent (§5). A returning
   ;; await therefore guarantees everything queued before it is durable.
   (testing "already halted → await throws immediately"
-    (let [core (d/make-core {} (throwing-append 1))]   ; 1st append throws → HALT
+    (let [core (d/make-core (atom {}) (throwing-append 1))]  ; 1st append throws → HALT
       (is (instance? Throwable @(d/submit! core (fn [_] {:a 1}))) "drive the halt")
       (is (some? (d/error core)) "precondition: core is halted")
       (is (thrown? clojure.lang.ExceptionInfo (d/await core))
@@ -144,7 +145,7 @@
                     (deliver start true)
                     (loop [] (when (= :wait @gate) (Thread/sleep 1) (recur)))
                     (throw (java.io.IOException. "boom")))
-          core    (d/make-core {} append!)]
+          core    (d/make-core (atom {}) append!)]
       (d/submit! core (fn [_] {:a 1}))                 ; blocks inside append!
       @start                                           ; drainer is now in append!
       (let [awaiter (future (try (d/await core) ::returned
@@ -159,7 +160,7 @@
   ;; patch-fn is a user-code verdict, rejected per-tx like any authoring error —
   ;; the drainer keeps going and the core is NOT halted (§5).
   (let [{:keys [log append!]} (recording-append)
-        core (d/make-core {} append!)
+        core (d/make-core (atom {}) append!)
         blew @(d/submit! core (fn [_] (let [rec (fn rec [n] (inc (rec (inc n))))] (rec 0))))
         ok   @(d/submit! core (fn [_] {:a 1}))]
     (is (instance? StackOverflowError blew) "the runaway patch-fn is rejected via its promise")
@@ -173,7 +174,7 @@
   ;; into a HALT — a dying JVM must not keep writing to disk (§5). Throwing a
   ;; bare OutOfMemoryError *object* is safe; only the real JVM condition is not.
   (let [{:keys [log append!]} (recording-append)
-        core (d/make-core {} append!)
+        core (d/make-core (atom {}) append!)
         p    (d/submit! core (fn [_] (throw (OutOfMemoryError. "simulated"))))]
     (is (instance? OutOfMemoryError @p) "the VM error reaches the in-flight tx's promise")
     (is (instance? OutOfMemoryError (d/error core)) "and HALTs the core, not a per-tx reject")
@@ -192,7 +193,7 @@
   ;; so quiesce! must still flush all of it.
   (let [{:keys [log append!]} (recording-append)
         slow (fn [patch] (Thread/sleep 2) (append! patch))
-        core (d/make-core {} slow)]
+        core (d/make-core (atom {}) slow)]
     (dotimes [i 5] (d/submit! core (fn [_] {(keyword (str "a" i)) i})))
     (d/await core)                                     ; period 1 drains → drainer retires
     (dotimes [i 5] (d/submit! core (fn [_] {(keyword (str "b" i)) i})))  ; period 2, no await
@@ -204,13 +205,47 @@
     (testing "quiesce is halt-safe / re-entrant on a quiescent core (never throws)"
       (is (nil? (d/quiesce! core)) "a second quiesce just returns nil"))))
 
+(defn- ex-data-of [f]
+  ;; run f, returning the ex-data of the ExceptionInfo it throws (nil if it didn't).
+  (try (f) nil (catch clojure.lang.ExceptionInfo e (ex-data e))))
+
+(deftest submit-and-await-refuse-on-sealed-and-halted-cores
+  ;; Locks down enqueue!'s refusal detection: it decides "was I refused?" by
+  ;; (identical? old new), which only holds because the swap fn returns `d`
+  ;; ITSELF untouched on refusal. If that fn is ever "cleaned up" to
+  ;; (assoc d ...) unconditionally, old/new diverge and refusals silently stop
+  ;; being detected — the compiler won't catch it, but this test will. We also
+  ;; pin the two distinct markers the write-side entry points surface.
+  (testing "sealed (closed) core → submit!/await throw :dj.recorder/closed"
+    (let [{:keys [append!]} (recording-append)
+          core (d/make-core (atom {}) append!)]
+      (d/quiesce! core)                                 ; seal + drain + retire
+      (is (:dj.recorder/closed (ex-data-of #(d/submit! core (fn [_] {:a 1}))))
+          "submit! on a sealed core throws the closed ex-info")
+      (is (:dj.recorder/closed (ex-data-of #(d/await core)))
+          "await on a sealed core throws the closed ex-info (no stray drainer)")))
+  (testing "halted core → submit!/await throw :dj.recorder/halted"
+    (let [core (d/make-core (atom {}) (throwing-append 1))]  ; 1st append throws → HALT
+      (is (instance? Throwable @(d/submit! core (fn [_] {:a 1}))) "drive the halt")
+      (is (some? (d/error core)) "precondition: the core is halted")
+      (is (:dj.recorder/halted (ex-data-of #(d/submit! core (fn [_] {:b 2}))))
+          "submit! on a halted core throws the halted ex-info")
+      (is (:dj.recorder/halted (ex-data-of #(d/await core)))
+          "await on a halted core throws the halted ex-info")))
+  (testing "halted AND sealed → halted wins the reporting (enqueue! prefers :error)"
+    (let [core (d/make-core (atom {}) (throwing-append 1))]
+      @(d/submit! core (fn [_] {:a 1}))                 ; halt it
+      (d/quiesce! core)                                 ; then seal it (halt-safe, no-throw)
+      (is (:dj.recorder/halted (ex-data-of #(d/submit! core (fn [_] {:b 2}))))
+          "a core that is both halted and sealed reports halted, not closed"))))
+
 (deftest integrates-with-real-storage
   ;; The drainer's append! is the real file writer; after draining, an
   ;; independent read-log must reproduce the same state (one fold, §3/§6).
   (let [f (doto (java.io.File/createTempFile "dj-dispatch" ".edn") .delete .deleteOnExit)
         path (.getPath f)]
     (with-open [w (s/open-writer path)]
-      (let [core (d/make-core {} (fn [patch] (s/append! w patch)))]
+      (let [core (d/make-core (atom {}) (fn [patch] (s/append! w patch)))]
         @(d/submit! core (fn [_] {:user {:name "Bob"}}))
         @(d/submit! core (fn [_] {:user {:age 30}}))
         @(d/submit! core (fn [_] {:tags #{:a :b}}))

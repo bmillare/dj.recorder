@@ -89,7 +89,7 @@
         (is (instance? Throwable
                        @(r/patch! db {:items (p/read-splice [{:at 0 :+ [9]}])}))
             "a rejected tx resolves its promise to a Throwable (the error channel)")
-        (is (nil? (r/halted db)) "a patch error does NOT halt the db")
+        (is (nil? (r/error db)) "a patch error does NOT halt the db")
         (is (= {:items 5 :ok true} @(r/patch! db {:ok true}))
             "and the db keeps working after a rejected tx")
         (finally (r/close! db))))))
@@ -105,7 +105,7 @@
         (is (= {:keep 1} @(r/tx! db (fn [_] nil)))
             "nil return leaves the realized state untouched")
         (is (= {:keep 1} @db) "the db is preserved, not nilled")
-        (is (nil? (r/halted db)) "a nil patch does not halt the db")
+        (is (nil? (r/error db)) "a nil patch does not halt the db")
         @(r/patch! db {:added true})               ; still writable afterwards
         (finally (r/close! db)))
       ;; and the nil no-op persisted nothing: a fresh re-open replays no nil
@@ -172,7 +172,7 @@
       (.close ^java.lang.AutoCloseable (.-writer ^dj.recorder.Recorder db)) ; sabotage the writer
       (is (instance? Throwable @(r/patch! db {:b 2}))
           "the next write's append throws → the tx promise carries the I/O error")
-      (is (some? (r/halted db)) "the db is now halted")
+      (is (some? (r/error db)) "the db is now halted")
       (is (nil? (r/close! db)) "close! on a halted db returns nil, it does not throw")
       (is (= {:a 1} @db) "the halted+closed db still derefs to its last good state"))))
 

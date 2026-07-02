@@ -71,9 +71,11 @@
 (defn open
   "Open the log at `path` and return a `Recorder` (a `deref`-able db handle).
 
-  Acquires the single-writer file lock, replays the log onto `baseline` (the
-  *same* `apply-patch` fold the drainer uses), and wires a durable `append!`
-  into a fresh dispatch core. `@db` then reads the rehydrated state instantly.
+  Acquires the single-writer file lock (fail-fast — throws immediately if the
+  log is already locked, whether by another process or an unclosed handle in
+  this one, rather than blocking), replays the log onto `baseline` (the *same*
+  `apply-patch` fold the drainer uses), and wires a durable `append!` into a
+  fresh dispatch core. `@db` then reads the rehydrated state instantly.
 
   opts (a map; all optional):
     :baseline      initial value to fold the log onto (default `{}`). Root state

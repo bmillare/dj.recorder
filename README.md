@@ -3,37 +3,52 @@
 The missing middle for lightweight state persistence in Clojure.
 
 A durable, crash-safe reference for **native Clojure data structures** — the
-synchronous read ergonomics of an atom with the durability of a database,
-backed by an append-only delta log and background compaction, with **no native
-or embedded-database dependencies** (pure JVM/Clojure).
+synchronous read ergonomics of an atom (`@db`) with the durability of an
+append-only, human-readable EDN delta log. No native or embedded-database
+dependencies (pure JVM/Clojure).
 
-> Status: **seed**. Design is settled enough to start; no public API is
-> committed yet. The authoritative design lives in the agent workspace
-> (`../agent/live/north_star.md`, `../agent/live/gaps.md`,
-> `../agent/ledger/tactical_ideation.md`).
+```clojure
+(require '[dj.recorder :as r])
+
+(def db (r/open "state.edn"))         ; lock + rehydrate the log; ready the drainer
+@db                                   ; current state — instant, never blocks on I/O
+(r/patch! db {:user {:name "Ada"}})   ; append a literal patch; returns a per-tx promise
+(r/tx! db (fn [s] ...))               ; read-modify-write authoring fn (race-free)
+(r/update! db [:a :b] inc)            ; deep-leaf RMW sugar
+(r/move! db [:xs] 0 2)                ; reorder a vector element
+(r/await db)                          ; block until the queue drains (agent-style)
+(r/close! db)                         ; drain, close the file, release the lock
+```
+
+> Status: **alpha.** The core is built and tested — an append-only EDN log with
+> torn-tail-aware rehydrate and a single-writer file lock, an on-demand
+> virtual-thread dispatcher with persist-then-publish ordering and
+> halt-on-I/O-failure semantics, and a deep *additive* patch algebra (with
+> `#dj.recorder/replace` / `dissoc` / `#dj.recorder/splice` escapes). The public
+> API above is not yet frozen, and compaction (delta-log roll-up) is designed
+> but not yet implemented.
 
 ## Develop
 
-This repo provides its toolchain via a Nix flake (JDK + Clojure CLI + babashka):
+Toolchain via a Nix flake (JDK + Clojure CLI + babashka):
 
 ```bash
 nix develop                       # enter dev shell
 clojure -M:nrepl                  # start an nREPL server (dynamic port)
-```
-
-Agents evaluate forms against the running nREPL via `clj-nrepl-eval`
-(see `../agent/ledger/2026-06-16-clojure-repl-light-workflow.md`).
-
-Run tests (once they exist):
-
-```bash
-clojure -M:test
+clojure -M:test                   # run the test suite
 ```
 
 ## Layout
 
 ```
-src/dj/recorder.clj   <- seed namespace
-deps.edn              <- deps + :nrepl / :test aliases
-flake.nix             <- pure-JVM dev shell
+src/dj/recorder.clj            <- public API / lifecycle (open/patch!/tx!/await/close!)
+src/dj/recorder/patch.clj      <- the patch algebra (additive merge + escapes)
+src/dj/recorder/dispatch.clj   <- the single-drainer dispatch core
+src/dj/recorder/storage.clj    <- append-only EDN log + file lock + rehydrate
+src/dj/recorder/protocols.clj  <- internal protocols (AppendLog, IRecorderCore)
+deps.edn                       <- deps + :nrepl / :test aliases
+flake.nix                      <- pure-JVM dev shell
 ```
+
+`dj.durable2` is earlier prototype code kept in-tree for design lineage; the
+shipping path is `dj.recorder`.

@@ -52,3 +52,10 @@ flake.nix                      <- pure-JVM dev shell
 
 `dj.durable2` is earlier prototype code kept in-tree for design lineage; the
 shipping path is `dj.recorder`.
+
+## License
+
+Copyright © 2026 Brent Millare
+
+Distributed under the [Eclipse Public License 2.0](LICENSE) (EPL-2.0), the same
+license as Clojure.

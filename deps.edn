@@ -23,4 +23,18 @@
    :extra-deps {io.github.cognitect-labs/test-runner
                 {:git/tag "v0.5.1" :git/sha "dfb30dd"}
                 org.clojure/test.check {:mvn/version "1.1.1"}}
-   :main-opts ["-m" "cognitect.test-runner"]}}}
+   :main-opts ["-m" "cognitect.test-runner"]}
+
+  ;; Adapter smoke test (OPT-IN, run infrequently). The core :test suite stays
+  ;; dependency-free; this alias is the ONLY place dj.concurrency is pulled onto
+  ;; the classpath (git-SHA dep — not yet on Clojars), and it scans only the
+  ;; isolated `test-adapter/` path so `dj.recorder.adapter.concurrency` — which
+  ;; requires dj.concurrency — never breaks the core run.  Run with:
+  ;;   clojure -M:adapter
+  :adapter
+  {:extra-paths ["test-adapter"]
+   :extra-deps {io.github.bmillare/dj.concurrency
+                {:git/sha "090cb2bdcaee709fbc5f934d4b3d0d187e2492e6"}
+                io.github.cognitect-labs/test-runner
+                {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+   :main-opts ["-m" "cognitect.test-runner" "-d" "test-adapter"]}}}

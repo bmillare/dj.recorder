@@ -68,7 +68,8 @@ Toolchain via a Nix flake (JDK + Clojure CLI + babashka):
 ```bash
 nix develop                       # enter dev shell
 clojure -M:nrepl                  # start an nREPL server (dynamic port)
-clojure -M:test                   # run the test suite
+clojure -M:test                   # run the core suite (dependency-free)
+clojure -M:adapter                # opt-in adapter smoke test (pulls in dj.concurrency)
 ```
 
 ## Layout
@@ -92,7 +93,10 @@ Adapters under `dj.recorder.adapter.*` are **opt-in**: dj.recorder's own `:deps`
 stay empty, and requiring `dj.recorder` never loads them. Each implements
 *another* library's protocol so that library can use a dj.recorder db as its
 durable store (cf. `ring.adapter.*`). Only code that wants one pulls both
-libraries onto the classpath and requires the adapter ns.
+libraries onto the classpath and requires the adapter ns. Their tests live in
+`test-adapter/` (outside the core suite) and run only via `-M:adapter`, which is
+the sole place the adapted library is pulled onto the classpath — so the core
+suite stays fast and dependency-free.
 
 ## License
 

@@ -45,6 +45,29 @@
              (:state res))
           "markers round-trip through the actual file path"))))
 
+(deftest ensure-parent-dir-creates-missing-subdirs
+  ;; A first-run open into a fresh subdir must Just Work: ensure-parent-dir!
+  ;; creates the (possibly nested) parent before the lock's .lock_status sidecar
+  ;; — the first filesystem touch — would otherwise fail on the missing dir.
+  (let [base (doto (java.io.File/createTempFile "dj-recorder-parentdir" "")
+               (.delete))                          ; reuse the name as a dir root
+        nested (io/file base "a" "b" "state.edn")
+        path   (.getPath nested)]
+    (.deleteOnExit base)
+    (try
+      (is (not (.exists (.getParentFile nested))) "parent dir absent to start")
+      (s/ensure-parent-dir! path)
+      (is (.isDirectory (.getParentFile nested)) "parent dir (and ancestors) created")
+      ;; and the writer now opens into it and round-trips
+      (with-open [w (s/open-writer path)]
+        (proto/append! w {:k 1}))
+      (is (= {:k 1} (:state (s/read-log {} path))))
+      ;; a bare filename (no parent) is a harmless no-op, not a throw
+      (is (nil? (s/ensure-parent-dir! "state.edn")))
+      (finally
+        ;; best-effort recursive cleanup of the temp tree
+        (doseq [f (reverse (file-seq base))] (.delete ^java.io.File f))))))
+
 (deftest append-refuses-non-edn-patch
   ;; The write-path choke point: a patch carrying a live object (here a fn) is
   ;; outside patch's replayable-EDN whitelist, so the structural gate

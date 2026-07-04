@@ -1,7 +1,7 @@
 (ns dj.recorder-test
   "Exercises the public API / lifecycle: open/patch!/tx!/@db/
-  await/close!, the update!/move! sugar, deref-based read-your-writes (the error
-  channel surfaces a rejected tx as a Throwable), durable round-trip across a
+  await/close!, the update!/move! sugar, deref-based read-your-writes (a rejected
+  tx throws its Throwable on deref), durable round-trip across a
   close+re-open, the torn-tail :surface/:discard policy, the single-writer lock,
   and the closed-rejects-writes contract. Runtime deep-dive §1/§3/§4/§5/§6."
   (:refer-clojure :exclude [await])
@@ -81,14 +81,14 @@
             "move! reorders a vector element")
         (finally (r/close! db))))))
 
-(deftest rejected-tx-surfaces-throwable-via-deref
+(deftest rejected-tx-throws-on-deref
   (with-path [path]
     (let [db (r/open path {:baseline {:items 5}})]            ; :items is a scalar
       (try
         ;; #dj.recorder/splice requires a vector -> apply-patch throws -> rejected tx
-        (is (instance? Throwable
-                       @(r/patch! db {:items (p/read-splice [{:at 0 :+ [9]}])}))
-            "a rejected tx resolves its promise to a Throwable (the error channel)")
+        (is (thrown? Throwable
+                     @(r/patch! db {:items (p/read-splice [{:at 0 :+ [9]}])}))
+            "a rejected tx throws its Throwable on deref (public error channel)")
         (is (nil? (r/error db)) "a patch error does NOT halt the db")
         (is (= {:items 5 :ok true} @(r/patch! db {:ok true}))
             "and the db keeps working after a rejected tx")
@@ -170,8 +170,8 @@
     (let [db (r/open path)]
       @(r/patch! db {:a 1})                                  ; one good, durable write
       (.close ^java.lang.AutoCloseable (.-writer ^dj.recorder.Recorder db)) ; sabotage the writer
-      (is (instance? Throwable @(r/patch! db {:b 2}))
-          "the next write's append throws → the tx promise carries the I/O error")
+      (is (thrown? Throwable @(r/patch! db {:b 2}))
+          "the next write's append throws → deref of the tx promise throws the I/O error")
       (is (some? (r/error db)) "the db is now halted")
       (is (nil? (r/close! db)) "close! on a halted db returns nil, it does not throw")
       (is (= {:a 1} @db) "the halted+closed db still derefs to its last good state"))))

@@ -13,6 +13,7 @@
     (r/tx! db (fn [s] {:k v}))           ; enqueue a read-modify-write authoring fn
     (r/update! db [:a :b] inc)           ; sugar: deep read-modify-write leaf
     (r/move! db [:xs] 0 2)               ; sugar: reorder a vector element
+    @(r/patch! db {:k v})                ; read-your-writes: deref -> new state (throws on failure)
     (r/await db)                         ; block until the queue drains (agent-style)
     (r/close! db)                        ; drain, close the file, release the lock
 
@@ -88,12 +89,14 @@
 
   On any failure during open (torn-tail surface, I/O), the file lock is released
   — and the writer, if already opened, closed — before the exception propagates,
-  so a failed open never leaks either. A missing file opens a fresh db at
+  so a failed open never leaks either. A missing parent directory is created
+  (first-run into a fresh subdir just works); a missing file opens a fresh db at
   `baseline`."
   ([path] (open path {}))
   ([path {:keys [baseline on-torn-tail]
           :or   {baseline {} on-torn-tail :surface}}]
-   (let [lock (storage/file-lock path)]
+   (storage/ensure-parent-dir! path)     ; must precede the lock: the .lock_status
+   (let [lock (storage/file-lock path)]   ; sidecar is the first filesystem touch
      (.lock ^Lock lock)
      (try
        (let [{:keys [state torn-tail]} (storage/read-log baseline path)]
@@ -134,7 +137,34 @@
 ;; them as two names (vs. one `fn?`-dispatching entry) means data that happens
 ;; to be callable — records/maps implementing IFn — is never mistaken for an
 ;; authoring fn, and each name reads for exactly one job.
+;;
+;; The per-tx promise the caller gets back is a THROWING view over the dispatch
+;; core's raw promise: dispatch keeps a Throwable-or-value error channel
+;; internally (the drainer must never throw across `deliver`), and this public
+;; layer owns the caller-facing ergonomics — a failed tx throws on deref
+;; (future-style) instead of resolving *to* a Throwable, so read-your-writes is
+;; a plain `@`. (The dispatch docstring reserves this seam explicitly; a
+;; non-throwing/inspect accessor can be layered on later without widening it.)
 ;; ---------------------------------------------------------------------------
+
+(defn- throwing-promise
+  "Wrap a dispatch per-tx promise so `deref` re-throws a resolved `Throwable`
+  (future-style) instead of returning it — hoisting the error-channel unwrap out
+  of every caller. Success derefs to the new realized state, unchanged. The
+  timeout arity honors `timeout-val` (a timeout is not a failure). Sound because
+  a legitimate state value is never itself a Throwable (dispatch's pinned
+  non-goal), so `instance? Throwable` cleanly discriminates failure."
+  [p]
+  (reify
+    clojure.lang.IDeref
+    (deref [_]
+      (let [v @p] (if (instance? Throwable v) (throw v) v)))
+    clojure.lang.IBlockingDeref
+    (deref [_ timeout-ms timeout-val]
+      (let [v (deref p timeout-ms timeout-val)]
+        (if (instance? Throwable v) (throw v) v)))
+    clojure.lang.IPending
+    (isRealized [_] (realized? p))))
 
 (defn tx!
   "Enqueue a `state -> patch` authoring fn `f` and return its per-tx promise
@@ -144,12 +174,13 @@
   `patch/move` for building the returned patch; `update!`/`move!` wrap the
   common cases.
 
-  The returned promise is both the sync barrier and the error channel: it
-  resolves to the new realized state on success, or to a `Throwable` on a
-  patch/authoring or I/O error. Fire-and-forget = ignore it; sync = deref it
-  (and branch on `Throwable`). Because of persist-then-publish, `@db` may lag a
-  fire-and-forget write — to read your own write, deref the promise or `await`
-  first (§3).
+  The returned promise is both the sync barrier and the error channel:
+  dereferencing it blocks until the tx is durable, then yields the new realized
+  state — or THROWS the underlying `Throwable` if the tx failed (a
+  patch/authoring or I/O error), future-style. Fire-and-forget = ignore it;
+  sync/read-your-writes = `@` it. Because of persist-then-publish, `@db` may lag
+  a fire-and-forget write — to read your own write, deref the promise or `await`
+  first (§3). To inspect a halt without throwing, use `error` / `ex-data`.
 
   Throws if the db is closed or halted (§5/§6). The check here is the friendly
   fast path; the authoritative guard is the dispatch core itself, which is
@@ -159,7 +190,7 @@
   (when @(.-a-closed db)
     (throw (ex-info "dj.recorder: db is closed"
                     {:dj.recorder/closed true :path (str (.-path db))})))
-  (proto/submit! (.-core db) f))
+  (throwing-promise (proto/submit! (.-core db) f)))
 
 (defn patch!
   "Enqueue a literal `patch` (plain data) and return its per-tx promise: sugar
@@ -167,8 +198,8 @@
 
   The patch is applied against the latest realized state on the drainer and the
   *data* itself is persisted verbatim. Use `tx!` when the patch must be computed
-  from current state (read-modify-write). Same promise/error-channel semantics
-  as `tx!`."
+  from current state (read-modify-write). Same promise semantics as `tx!`: deref
+  yields the new state or throws the failure."
   [^Recorder db patch]
   (tx! db (constantly patch)))
 

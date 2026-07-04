@@ -83,6 +83,25 @@
                        :line line}
                       e)))))
 
+(defn ensure-parent-dir!
+  "Create `path`'s parent directory (and any missing ancestors) if absent, so a
+  first-run open into a fresh subdir succeeds instead of failing at the lock's
+  `.lock_status` sidecar (the first filesystem touch — `FileChannel/open …
+  CREATE` makes the file, never missing parents). No-op when the parent already
+  exists or `path` is a bare filename (no parent). Throws a friendly ex-info if
+  the parent still doesn't exist afterward (e.g. permissions) — fail-loud, and
+  called before the lock is taken so nothing is stranded.
+
+  Note: `File.mkdirs` returns `false` both on failure AND when the dir already
+  exists, so its return value is unreliable; this re-checks `.isDirectory`."
+  [path]
+  (when-let [^java.io.File parent (.getParentFile ^java.io.File (io/file path))]
+    (when-not (.isDirectory parent)
+      (.mkdirs parent)
+      (when-not (.isDirectory parent)
+        (throw (ex-info (str "dj.recorder: cannot create parent directory for " path)
+                        {:path (str path) :parent (str parent)}))))))
+
 (defn open-writer
   "Open `path` for append (creating it if absent) and return an `AppendLog`
   that is also `java.lang.AutoCloseable`. Single-writer: hold the file lock

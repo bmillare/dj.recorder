@@ -53,6 +53,154 @@ waiting on durability:
               :runs {run-id {:id run-id :status :started :steps [{:event :started}]}}}))
 ```
 
+## The patch format (deep dive)
+
+A **patch** is the unit of change in dj.recorder, and it's the idea worth
+understanding — the durable log is almost a thin wrapper on top of it. A patch
+is just **plain EDN data that describes how to transform one Clojure value into
+the next**, and applying one is a single pure function:
+
+```clojure
+(require '[dj.recorder.patch :as p])
+
+(p/apply-patch {:user {:name "Ada" :age 30}}   ; current value
+               {:user {:age 31}})              ; patch (plain data)
+;; => {:user {:name "Ada" :age 31}}
+```
+
+That function is the whole engine. A db is nothing more than an append-only log
+of patches plus `(reduce apply-patch baseline log)` to fold them back into state
+on open — the *same* fold the write thread uses to advance live state (one code
+path for memory and disk; a divergence there would be a corruption bug). You can
+also call `apply-patch` entirely on its own, as a generic "apply a described
+change" for native Clojure data — no db, no file, no I/O in sight.
+
+### The one rule: an untagged patch is additive
+
+Merging *adds*; it never shrinks or overwrites in place. What "add" means is
+dispatched on the current value:
+
+| current value | an untagged patch means |
+| :-- | :-- |
+| map / record | merge keys, recursing into each value |
+| set | union (add members) |
+| vector | concat — append the patch's elements |
+| list / seq | concat (append) |
+| scalar | replace (nothing to add to) |
+| `nil` *(as a patch)* | **identity — no change at all** |
+
+Recursion bottoms out on scalars, so cost scales with the *change*, not the size
+of the state. Records keep map semantics (an untagged map merges into them and
+the record type is preserved). Incompatible merges — e.g. a map patch against a
+scalar, or a vector patch against a map — **throw**, on the theory that it's
+almost always a mistake; reach for `#dj.recorder/replace` when you genuinely mean
+"change the shape."
+
+`nil` is worth pausing on: as a *patch* it means *no change*, everywhere. That
+makes a `state -> patch` function which returns `nil` (the natural "nothing to
+do" reflex) a safe no-op instead of nuking the root. The three intents people
+tend to conflate stay distinct:
+
+- **no change** → `nil`
+- **remove a key** → `dissoc` (below)
+- **store a literal `nil`** → `#dj.recorder/replace nil`
+
+### The escapes: `replace`, `dissoc`, `splice`
+
+Additive merge covers most edits; three tags cover the rest.
+
+**Overwrite** — `#dj.recorder/replace x` sets the value to `x` verbatim, no
+merge. Universal: replace a whole subtree, shrink a vector, change a value's
+shape (scalar → map), or store data that would otherwise look like a marker.
+
+**Remove** — two spellings of one idea:
+- *inline* (map keys / vector indices): the sentinel `:dj.recorder/dissoc` as a
+  **value** in a merge map deletes that key/index. Ergonomic for "update some
+  keys, delete others" in one map literal.
+- *op form* (sets / bulk): `#dj.recorder/dissoc <coll>` removes the listed keys
+  (from a map) or members (from a set).
+
+**Splice** — `#dj.recorder/splice [hunk ...]` does ordered positional vector
+edits (insert / delete / range-replace), modeled on a unix unified-diff hunk.
+Each hunk is `{:at i :- n :+ [..]}`: start index into the **original** vector,
+count removed, elements inserted. `{:at i :+ [..]}` is a pure insert,
+`{:at i :- n}` a pure delete, both together a range-replace. Hunks are all
+original-relative and must not overlap (they're applied high-index-first, so no
+offset bookkeeping is needed).
+
+### Worked examples
+
+Read each line as `current-value  ⟵ patch ⟶  result`:
+
+```clojure
+;; maps — merge, recurse into values, delete inline
+{:a 1 :b 2}                     {:b 3 :c 4}                   => {:a 1 :b 3 :c 4}
+{:user {:name "Bob" :age 30}}   {:user {:age 31}}             => {:user {:name "Bob" :age 31}}
+{:a 1 :b 2}                     {:b :dj.recorder/dissoc}      => {:a 1}
+
+;; nil = no change (NOT "store nil", NOT "delete")
+{:a 1}                          {:a nil}                      => {:a 1}
+{:a 1}                          {:a #dj.recorder/replace nil} => {:a nil}
+
+;; replace a whole subtree (escape) — :age is dropped
+{:user {:name "Bob" :age 30}}   {:user #dj.recorder/replace {:name "Alice"}}
+                                                              => {:user {:name "Alice"}}
+
+;; sets — union / remove members
+#{:a :b}                        #{:b :c}                      => #{:a :b :c}
+#{:a :b :c}                     #dj.recorder/dissoc #{:b}     => #{:a :c}
+
+;; vectors — append / in-place update / index removal / splice
+[1 2 3]                         [4 5]                         => [1 2 3 4 5]
+[{:name "Bob"} {:name "Carol"}] {0 {:name "Alice"}}           => [{:name "Alice"} {:name "Carol"}]
+[10 20 30]                      {1 :dj.recorder/dissoc}       => [10 30]
+[10 30]                         #dj.recorder/splice [{:at 1 :+ [20]}]         => [10 20 30]
+[10 20 30]                      #dj.recorder/splice [{:at 1 :- 1 :+ [:a :b]}] => [10 :a :b 30]
+
+;; the root can be any EDN — a scalar patch overwrites; a shape change is explicit
+41                              42                            => 42
+42                              #dj.recorder/replace {:a 1}   => {:a 1}
+```
+
+### Authoring helpers
+
+Hand-nesting a patch gets tedious for a deep read-modify-write or a reorder, so
+two constructors build the patch for you. Both **read the current value and
+return a plain-data patch** (no function is ever stored). Call them inside a
+`tx!` authoring fn, where `s` is the race-free dispatch-thread state:
+
+```clojure
+;; overwrite a deep leaf with (f old-leaf & args) — like clojure.core/update-in,
+;; but yields a minimal nested patch:
+(p/update-in s [:tracks "strobe" :plays] (fnil inc 0))
+;; => {:tracks {"strobe" {:plays 1}}}
+
+;; relocate a vector element from one index to another (emits a #splice):
+(p/move s [:crates "main"] 0 2)
+```
+
+`update!` / `move!` on the main API are one-liners over exactly these. Unlike
+additive merge, `update-in` *overwrites* its leaf, so a shrinking `f` (`dissoc`,
+`pop`) is reflected.
+
+### Using it standalone
+
+Nothing above requires the log. `dj.recorder.patch/apply-patch` — and
+`rehydrate`, i.e. `(reduce apply-patch baseline patches)` — is pure and
+dependency-free: a portable way to describe and apply a change to native Clojure
+data, whether or not you persist it. To read the tagged literals back from text
+(or EDN you stored yourself), register the reader tags:
+
+- for the **Clojure reader**: they live in `resources/data_readers.clj`, loaded
+  automatically when dj.recorder is on the classpath.
+- for **`clojure.edn/read`**: pass `dj.recorder.patch/data-readers` as the
+  `:readers` option (log replay uses `edn/read`, so it wires these in explicitly).
+
+One caveat if you `pr-str` patches yourself: the markers honor
+`*print-length*` / `*print-level*`, so bind both to `nil` first (the log writer
+already does) — otherwise a REPL-configured truncation can silently corrupt the
+printed patch.
+
 > Status: **alpha.** The core is built and tested — an append-only EDN log with
 > torn-tail-aware rehydrate and a single-writer file lock, an on-demand
 > virtual-thread dispatcher with persist-then-publish ordering and
